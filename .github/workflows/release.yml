@@ -108,7 +108,16 @@ jobs:
           cp -r /ucrt64/share/icons/hicolor dist/share/icons/ || true
           cp -r /ucrt64/share/icons/Adwaita dist/share/icons/ || true
           cp -r data/icons/hicolor/* dist/share/icons/hicolor/ || true
-          echo "GPL-3.0-or-later License" > dist/LICENSE
+
+
+          mkdir -p dist/share/licenses
+          cp -r /ucrt64/share/licenses/* dist/share/licenses/ || true
+
+          cargo install cargo-license
+          cargo license --authors > dist/THIRD-PARTY-LICENSES.txt
+          
+          # نسخ رخصة البرنامج
+          if [ -f "LICENSE" ]; then cp LICENSE dist/; else echo "GPL-3.0 License" > dist/LICENSE; fi
 
       - name: Generate Inno Setup Script (.iss)
         run: |
