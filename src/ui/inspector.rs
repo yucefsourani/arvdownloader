@@ -13,7 +13,15 @@ pub fn show_url_inspector_dialog<F>(
     settings: AppSettings,
     on_enqueue: F,
 ) where
-    F: Fn(String, String, String, QualityPreset, Option<String>, Option<u32>) + 'static,
+    F: Fn(
+            String,
+            String,
+            String,
+            QualityPreset,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+        ) + 'static,
 {
     let dialog = adw::Dialog::builder()
         .title("Inspect Media and Formats")
@@ -149,7 +157,15 @@ fn populate_inspector_content<F>(
     meta: VideoMetadata,
     on_enqueue: Rc<F>,
 ) where
-    F: Fn(String, String, String, QualityPreset, Option<String>, Option<u32>) + 'static,
+    F: Fn(
+            String,
+            String,
+            String,
+            QualityPreset,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+        ) + 'static,
 {
     let is_playlist = meta.is_playlist || !meta.playlist_entries.is_empty();
     let total_playlist_videos = meta.playlist_entries.len();
@@ -522,6 +538,7 @@ fn populate_inspector_content<F>(
     let url_val = meta.url.clone();
     let title_val = meta.title.clone();
     let platform_val = meta.platform_badge();
+    let thumb_url_val = meta.thumbnail_url.clone();
 
     download_btn.connect_clicked(move |_| {
         let idx = format_row.selected() as usize;
@@ -558,6 +575,7 @@ fn populate_inspector_content<F>(
             selected_preset,
             pl_items,
             expected_count,
+            thumb_url_val.clone(),
         );
         dialog_for_dl.close();
     });

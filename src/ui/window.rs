@@ -17,6 +17,8 @@ use std::rc::Rc;
 
 struct QueueRowWidgets {
     card: gtk::Box,
+    thumb_stack: gtk::Stack,
+    thumb_picture: gtk::Picture,
     playlist_badge: gtk::Label,
     title_label: gtk::Label,
     current_video_label: gtk::Label,
@@ -31,6 +33,184 @@ struct QueueRowWidgets {
     playlist_current_idx: u32,
     playlist_total: u32,
     playlist_completed_count: u32,
+}
+
+fn persist_queue_state(queue_rows_map: &Rc<RefCell<HashMap<u64, QueueRowWidgets>>>) {
+    let borrowed = queue_rows_map.borrow();
+    let mut tasks: Vec<DownloadTask> = borrowed.values().map(|w| w.task.clone()).collect();
+    tasks.sort_by_key(|t| t.id);
+    DownloadTask::save_queue(&tasks);
+}
+
+fn load_thumbnail_file_into_widgets(
+    path: &std::path::Path,
+    thumb_picture: &gtk::Picture,
+    thumb_stack: &gtk::Stack,
+) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let file = gio::File::for_path(path);
+    if let Ok(texture) = gdk::Texture::from_file(&file) {
+        thumb_picture.set_paintable(Some(&texture));
+        thumb_stack.set_visible_child_name("picture");
+        return true;
+    }
+    false
+}
+
+/// Builds a fixed-size thumbnail frame containing a `gtk::Stack` with two pages:
+/// - `"placeholder"`: a fallback icon (backup) shown whenever no local thumbnail image is available
+/// - `"picture"`: the actual thumbnail image
+fn build_thumbnail_widget(
+    width: i32,
+    height: i32,
+    is_audio: bool,
+) -> (gtk::Frame, gtk::Stack, gtk::Picture) {
+    let frame = gtk::Frame::new(None);
+    frame.set_size_request(width, height);
+    frame.set_valign(gtk::Align::Center);
+    frame.set_halign(gtk::Align::Center);
+
+    let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+
+    let placeholder = gtk::Image::from_icon_name(if is_audio {
+        "audio-x-generic-symbolic"
+    } else {
+        "video-x-generic-symbolic"
+    });
+    placeholder.set_pixel_size((height / 2).max(16));
+    placeholder.add_css_class("dim-label");
+    placeholder.set_size_request(width, height);
+
+    let picture = gtk::Picture::new();
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_size_request(width, height);
+
+    stack.add_named(&placeholder, Some("placeholder"));
+    stack.add_named(&picture, Some("picture"));
+    stack.set_visible_child_name("placeholder");
+    frame.set_child(Some(&stack));
+
+    (frame, stack, picture)
+}
+
+/// Builds the "Link" menu button (Open in Browser / Copy Link) used by queue and history rows
+fn build_link_button(url: &str) -> gtk::MenuButton {
+    let menu_btn = gtk::MenuButton::builder()
+        .icon_name("insert-link-symbolic")
+        .tooltip_text("Media Link")
+        .valign(gtk::Align::Center)
+        .build();
+
+    let popover_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    popover_box.set_margin_top(6);
+    popover_box.set_margin_bottom(6);
+    popover_box.set_margin_start(6);
+    popover_box.set_margin_end(6);
+
+    let open_btn = gtk::Button::builder()
+        .label("Open Link in Browser")
+        .has_frame(false)
+        .build();
+    let copy_btn = gtk::Button::builder()
+        .label("Copy Link")
+        .has_frame(false)
+        .build();
+
+    popover_box.append(&open_btn);
+    popover_box.append(&copy_btn);
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&popover_box));
+    menu_btn.set_popover(Some(&popover));
+
+    {
+        let url = url.to_string();
+        let popover = popover.clone();
+        open_btn.connect_clicked(move |_| {
+            popover.popdown();
+            let _ = open::that(&url);
+        });
+    }
+    {
+        let url = url.to_string();
+        let popover = popover.clone();
+        copy_btn.connect_clicked(move |_| {
+            if let Some(display) = gdk::Display::default() {
+                display.clipboard().set_text(&url);
+            }
+            popover.popdown();
+        });
+    }
+
+    menu_btn
+}
+
+/// Transfers a finished queue task's thumbnail into a unique Completed History thumbnail file.
+/// `move_file = true` renames the task thumbnail (single video), otherwise it is copied (playlist item).
+fn transfer_task_thumbnail_to_history(
+    task: &DownloadTask,
+    history_item_id: u64,
+    move_file: bool,
+) -> Option<PathBuf> {
+    let src = task.resolved_thumbnail_path()?;
+    let dest = metadata::new_history_thumbnail_file_path(history_item_id);
+    let ok = if move_file {
+        std::fs::rename(&src, &dest).is_ok()
+            || (std::fs::copy(&src, &dest).is_ok() && {
+                let _ = std::fs::remove_file(&src);
+                true
+            })
+    } else {
+        std::fs::copy(&src, &dest).is_ok()
+    };
+    if ok {
+        Some(dest)
+    } else {
+        None
+    }
+}
+
+fn fetch_and_apply_task_thumbnail(
+    task_id: u64,
+    url: String,
+    queue_rows_map: Rc<RefCell<HashMap<u64, QueueRowWidgets>>>,
+) {
+    let trimmed = url.trim().to_string();
+    if trimmed.is_empty() || (!trimmed.starts_with("http://") && !trimmed.starts_with("https://")) {
+        return;
+    }
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(saved_path) = updater::fetch_and_save_task_thumbnail(task_id, &trimmed).await {
+            let mut should_persist = false;
+            {
+                let mut map_borrow = queue_rows_map.borrow_mut();
+                if let Some(w) = map_borrow.get_mut(&task_id) {
+                    if load_thumbnail_file_into_widgets(
+                        &saved_path,
+                        &w.thumb_picture,
+                        &w.thumb_stack,
+                    ) {
+                        w.task.thumbnail_path = Some(saved_path);
+                        if w.task.thumbnail_url.is_none() {
+                            w.task.thumbnail_url = Some(trimmed);
+                        }
+                        should_persist = true;
+                    }
+                } else {
+                    // Row already left the queue (completed/removed) while the image was downloading.
+                    // Completed History keeps its own copy (or re-downloads from `thumbnail_url`), so
+                    // this temporary task file is no longer referenced by anything.
+                    metadata::delete_task_thumbnail(task_id, Some(&saved_path));
+                }
+            }
+            if should_persist {
+                persist_queue_state(&queue_rows_map);
+            }
+        }
+    });
 }
 
 pub fn apply_theme(dark_theme: bool) {
@@ -536,12 +716,15 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     }
 
     // Populate initial completed history UI (verifying files exist and capping at 10 rows)
+    // `refresh_holder` lets each history card's Remove button trigger a full refresh.
+    let refresh_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let refresh_history_ui: Rc<dyn Fn()> = {
         let history_rc = history_rc.clone();
         let history_list_box = history_list_box.clone();
         let history_stack = history_stack.clone();
         let history_stack_page = history_stack_page.clone();
         let clear_history_btn = clear_history_btn.clone();
+        let refresh_holder = refresh_holder.clone();
 
         Rc::new(move || {
             while let Some(child) = history_list_box.first_child() {
@@ -553,7 +736,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                     CompletedItem::save_history(&items_mut);
                 }
             }
-            let items = history_rc.borrow();
+            let items: Vec<CompletedItem> = history_rc.borrow().clone();
             history_stack_page.set_badge_number(items.len() as u32);
             clear_history_btn.set_sensitive(!items.is_empty());
 
@@ -564,11 +747,12 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
             history_stack.set_visible_child_name("list");
 
             for item in items.iter().rev() {
-                let card = build_completed_item_card(item);
+                let card = build_completed_item_card(item, &history_rc, &refresh_holder);
                 history_list_box.append(&card);
             }
         })
     };
+    *refresh_holder.borrow_mut() = Some(refresh_history_ui.clone());
     refresh_history_ui();
 
     // Clear history button handler with confirmation choice dialog
@@ -585,7 +769,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
             };
             let dialog = adw::AlertDialog::builder()
                 .heading("Clear Download History?")
-                .body("Are you sure you want to clear all items from the completed history list? Your downloaded files on disk will not be deleted.")
+                .body("Are you sure you want to clear all items from the completed history list? Their saved thumbnails will be deleted, but your downloaded files on disk will not be deleted.")
                 .default_response("cancel")
                 .close_response("cancel")
                 .build();
@@ -597,8 +781,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
             let refresh_history_ui = refresh_history_ui.clone();
             dialog.connect_response(None, move |_, response| {
                 if response == "clear" {
-                    history_rc.borrow_mut().clear();
-                    CompletedItem::save_history(&[]);
+                    CompletedItem::clear_and_save(&mut history_rc.borrow_mut());
                     refresh_history_ui();
                 }
             });
@@ -632,7 +815,15 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     // Helper closure to enqueue a new download task
     let enqueue_download: Rc<
-        dyn Fn(String, String, String, QualityPreset, Option<String>, Option<u32>),
+        dyn Fn(
+            String,
+            String,
+            String,
+            QualityPreset,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+        ),
     > = {
         let next_task_id = next_task_id.clone();
         let settings_rc = settings_rc.clone();
@@ -649,7 +840,8 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                   platform: String,
                   preset: QualityPreset,
                   playlist_items: Option<String>,
-                  expected_playlist_count: Option<u32>| {
+                  expected_playlist_count: Option<u32>,
+                  thumbnail_url: Option<String>| {
                 let task_id = next_task_id.get();
                 next_task_id.set(task_id + 1);
 
@@ -663,10 +855,16 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                     output_dir,
                     playlist_items,
                     expected_playlist_count,
+                    thumbnail_url: thumbnail_url.clone(),
+                    thumbnail_path: None,
+                    saved_fraction: 0.0,
+                    saved_status: "Waiting in queue...".to_string(),
+                    completed_files: Vec::new(),
                 };
 
                 let row_widgets = build_queue_row_widgets(
                     &task,
+                    false,
                     &queue_list_box,
                     &queue_stack,
                     &queue_stack_page,
@@ -676,6 +874,11 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
 
                 queue_list_box.prepend(&row_widgets.card);
                 queue_rows_map.borrow_mut().insert(task_id, row_widgets);
+                persist_queue_state(&queue_rows_map);
+
+                if let Some(thumb_url) = thumbnail_url {
+                    fetch_and_apply_task_thumbnail(task_id, thumb_url, queue_rows_map.clone());
+                }
 
                 queue_stack.set_visible_child_name("list");
                 queue_stack_page.set_badge_number(queue_rows_map.borrow().len() as u32);
@@ -685,6 +888,49 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
             },
         )
     };
+
+    // Restore any saved/stopped queue rows from disk (`queue.json`) so the user can resume them
+    {
+        let saved_tasks = DownloadTask::load_saved_queue();
+        DownloadTask::cleanup_orphan_thumbnails(&saved_tasks, &history_rc.borrow());
+        if !saved_tasks.is_empty() {
+            for mut saved_task in saved_tasks {
+                if saved_task.id >= next_task_id.get() {
+                    next_task_id.set(saved_task.id + 1);
+                }
+                if let Some(existing_thumb) = saved_task.resolved_thumbnail_path() {
+                    saved_task.thumbnail_path = Some(existing_thumb);
+                } else {
+                    saved_task.thumbnail_path = None;
+                }
+
+                let row_widgets = build_queue_row_widgets(
+                    &saved_task,
+                    true,
+                    &queue_list_box,
+                    &queue_stack,
+                    &queue_stack_page,
+                    &queue_rows_map,
+                    &job_queue_tx,
+                );
+                let task_id = saved_task.id;
+                let missing_local_thumb = saved_task.thumbnail_path.is_none();
+                let maybe_thumb_url = saved_task.thumbnail_url.clone();
+
+                queue_list_box.prepend(&row_widgets.card);
+                queue_rows_map.borrow_mut().insert(task_id, row_widgets);
+
+                if missing_local_thumb {
+                    if let Some(thumb_url) = maybe_thumb_url {
+                        fetch_and_apply_task_thumbnail(task_id, thumb_url, queue_rows_map.clone());
+                    }
+                }
+            }
+            queue_stack.set_visible_child_name("list");
+            queue_stack_page.set_badge_number(queue_rows_map.borrow().len() as u32);
+            persist_queue_state(&queue_rows_map);
+        }
+    }
 
     // Listen for DownloadProgressEvents on the GTK main loop
     {
@@ -703,9 +949,11 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         task_id,
                         status_text,
                     } => {
-                        if let Some(w) = queue_rows_map.borrow().get(&task_id) {
+                        if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
                             w.status_label.set_text(&status_text);
-                            w.progress_bar.set_fraction(0.02);
+                            w.task.saved_status = status_text;
+                            let start_frac = w.task.saved_fraction.max(0.02);
+                            w.progress_bar.set_fraction(start_frac);
                             w.progress_bar.set_text(Some("Starting..."));
                             w.cancel_btn.set_visible(true);
                             w.retry_btn.set_visible(false);
@@ -713,9 +961,41 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         }
                     }
                     DownloadProgressEvent::TitleUpdated { task_id, title } => {
+                        let mut updated = false;
                         if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
                             w.title_label.set_text(&title);
                             w.task.title = title;
+                            updated = true;
+                        }
+                        if updated {
+                            persist_queue_state(&queue_rows_map);
+                        }
+                    }
+                    DownloadProgressEvent::ThumbnailUpdated {
+                        task_id,
+                        thumbnail_url,
+                    } => {
+                        let should_fetch = {
+                            let mut map_borrow = queue_rows_map.borrow_mut();
+                            if let Some(w) = map_borrow.get_mut(&task_id) {
+                                let same_url =
+                                    w.task.thumbnail_url.as_deref() == Some(thumbnail_url.as_str());
+                                let already_visible = w.thumb_stack.visible_child_name().as_deref()
+                                    == Some("picture")
+                                    && w.task.resolved_thumbnail_path().is_some();
+                                w.task.thumbnail_url = Some(thumbnail_url.clone());
+                                !(same_url && already_visible)
+                            } else {
+                                false
+                            }
+                        };
+                        if should_fetch {
+                            persist_queue_state(&queue_rows_map);
+                            fetch_and_apply_task_thumbnail(
+                                task_id,
+                                thumbnail_url,
+                                queue_rows_map.clone(),
+                            );
                         }
                     }
                     DownloadProgressEvent::PlaylistDetected {
@@ -723,6 +1003,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         playlist_title,
                         total_items,
                     } => {
+                        let mut updated = false;
                         if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
                             let safe_folder = metadata::sanitize_fs_name(&playlist_title, 48, 144);
                             w.title_label.set_text(&format!(
@@ -732,6 +1013,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                             w.task.title = playlist_title;
                             if total_items > 0 {
                                 w.playlist_total = total_items;
+                                w.task.expected_playlist_count = Some(total_items);
                             }
                             w.playlist_badge.set_visible(true);
                             w.current_video_label.set_visible(true);
@@ -751,6 +1033,10 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                 w.playlist_progress_bar
                                     .set_text(Some("Overall Playlist: Preparing items..."));
                             }
+                            updated = true;
+                        }
+                        if updated {
+                            persist_queue_state(&queue_rows_map);
                         }
                     }
                     DownloadProgressEvent::PlaylistItemStarted {
@@ -820,8 +1106,16 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         let maybe_completed = {
                             let mut map_borrow = queue_rows_map.borrow_mut();
                             if let Some(w) = map_borrow.get_mut(&task_id) {
-                                w.playlist_completed_count =
-                                    w.playlist_completed_count.max(current_index);
+                                // Already recorded during a previous (stopped/resumed) run of this
+                                // task? yt-dlp re-reports skipped "already downloaded" files on resume.
+                                let already_recorded = w.task.completed_files.contains(&file_path);
+                                if !already_recorded {
+                                    w.task.completed_files.push(file_path.clone());
+                                }
+                                w.playlist_completed_count = w
+                                    .playlist_completed_count
+                                    .max(current_index)
+                                    .max(w.task.completed_files.len() as u32);
                                 w.playlist_total =
                                     w.playlist_total.max(total_items).max(current_index);
 
@@ -852,6 +1146,9 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     current_index, total
                                 )));
 
+                                if already_recorded {
+                                    None
+                                } else {
                                 Some(CompletedItem {
                                     id: task_id.wrapping_mul(1000).wrapping_add(current_index as u64),
                                     title: format!(
@@ -863,13 +1160,22 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     quality_badge: w.task.preset.short_badge(),
                                     file_path,
                                     completed_at: "Completed".to_string(),
+                                    thumbnail_url: w.task.thumbnail_url.clone(),
+                                    // The shared task image may still belong to the previous video
+                                    // while the next one is loading, so the history card downloads
+                                    // this video's own image from `thumbnail_url` into its own file.
+                                    thumbnail_path: None,
                                 })
+                                }
                             } else {
                                 None
                             }
                         };
 
                         if let Some(item) = maybe_completed {
+                            // Save the recorded file list so a later resume (even after restart)
+                            // never re-adds this video to Completed History.
+                            persist_queue_state(&queue_rows_map);
                             {
                                 let mut hist = history_rc.borrow_mut();
                                 CompletedItem::push_and_save(&mut hist, item);
@@ -884,7 +1190,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         eta,
                         status_text,
                     } => {
-                        if let Some(w) = queue_rows_map.borrow().get(&task_id) {
+                        if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
                             if w.playlist_total > 1 || w.playlist_current_idx > 0 {
                                 let idx = w.playlist_current_idx.max(1);
                                 let total = w.playlist_total.max(idx);
@@ -899,7 +1205,9 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     fraction * 100.0
                                 )));
 
-                                let base_done = idx.saturating_sub(1).max(done.min(idx.saturating_sub(1))) as f64;
+                                let base_done =
+                                    idx.saturating_sub(1).max(done.min(idx.saturating_sub(1)))
+                                        as f64;
                                 let overall_pl_frac =
                                     ((base_done + fraction) / (total as f64)).clamp(0.0, 0.999);
                                 w.playlist_progress_bar.set_visible(true);
@@ -911,12 +1219,15 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     remaining,
                                     overall_pl_frac * 100.0
                                 )));
+                                w.task.saved_fraction = overall_pl_frac;
                             } else {
                                 w.progress_bar.set_fraction(fraction);
                                 w.progress_bar
                                     .set_text(Some(&format!("{:.1}%", fraction * 100.0)));
+                                w.task.saved_fraction = fraction;
                             }
                             w.status_label.set_text(&status_text);
+                            w.task.saved_status = status_text;
                             w.speed_eta_label
                                 .set_text(&format!("{} • ETA {}", speed, eta));
                         }
@@ -936,8 +1247,9 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         }
                     }
                     DownloadProgressEvent::PostProcessing { task_id, step } => {
-                        if let Some(w) = queue_rows_map.borrow().get(&task_id) {
+                        if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
                             w.progress_bar.set_fraction(0.99);
+                            w.task.saved_fraction = 0.99;
                             if w.playlist_total > 1 || w.playlist_current_idx > 0 {
                                 let idx = w.playlist_current_idx.max(1);
                                 let total = w.playlist_total.max(idx);
@@ -949,6 +1261,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                 w.progress_bar.set_text(Some("99% — Finalizing..."));
                             }
                             w.status_label.set_text(&step);
+                            w.task.saved_status = step;
                             w.speed_eta_label.set_text("ffmpeg merge");
                         }
                     }
@@ -959,6 +1272,8 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                     } => {
                         let removed = queue_rows_map.borrow_mut().remove(&task_id);
                         if let Some(w) = removed {
+                            persist_queue_state(&queue_rows_map);
+
                             queue_list_box.remove(&w.card);
                             let remaining = queue_rows_map.borrow().len();
                             queue_stack_page.set_badge_number(remaining as u32);
@@ -967,7 +1282,12 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                             }
 
                             // If playlist items were not already added individually, add the single item
-                            if w.playlist_completed_count == 0 {
+                            // Single video (or a "playlist" URL that resolved to one video): no
+                            // per-item entries were recorded, so add one history entry now.
+                            if w.task.completed_files.is_empty() {
+                                // Keep the thumbnail: move it from the queue task into Completed History
+                                let history_thumb =
+                                    transfer_task_thumbnail_to_history(&w.task, task_id, true);
                                 let completed_item = CompletedItem {
                                     id: task_id,
                                     title: title.clone(),
@@ -976,12 +1296,21 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     quality_badge: w.task.preset.short_badge(),
                                     file_path,
                                     completed_at: "Completed".to_string(),
+                                    thumbnail_url: w.task.thumbnail_url.clone(),
+                                    thumbnail_path: history_thumb,
                                 };
                                 {
                                     let mut hist = history_rc.borrow_mut();
                                     CompletedItem::push_and_save(&mut hist, completed_item);
                                 }
                                 refresh_history_ui();
+                            } else {
+                                // Playlist: each finished video already received its own copy in
+                                // Completed History, so the shared task file is just a duplicate.
+                                metadata::delete_task_thumbnail(
+                                    task_id,
+                                    w.task.thumbnail_path.as_deref(),
+                                );
                             }
 
                             let summary_text = if w.playlist_completed_count > 1 {
@@ -1001,24 +1330,47 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                         }
                     }
                     DownloadProgressEvent::Failed { task_id, error } => {
-                        if let Some(w) = queue_rows_map.borrow().get(&task_id) {
-                            w.status_label.set_text(&format!("Error: {}", error));
+                        let mut updated = false;
+                        if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
+                            let msg = format!("Error: {}", error);
+                            w.status_label.set_text(&msg);
+                            w.task.saved_status = msg;
                             w.speed_eta_label.set_text("Failed");
-                            w.progress_bar.set_text(Some("Failed"));
+                            w.progress_bar.set_text(Some("Failed — Click Resume"));
                             w.cancel_btn.set_visible(false);
                             w.retry_btn.set_visible(true);
                             w.remove_btn.set_visible(true);
+                            updated = true;
+                        }
+                        if updated {
+                            persist_queue_state(&queue_rows_map);
                         }
                     }
                     DownloadProgressEvent::Cancelled { task_id } => {
-                        if let Some(w) = queue_rows_map.borrow().get(&task_id) {
-                            w.status_label.set_text("Cancelled by user");
+                        let mut updated = false;
+                        if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
+                            let frac = w.progress_bar.fraction().max(w.task.saved_fraction);
+                            w.task.saved_fraction = frac;
+                            let status_msg = "Stopped — Click Resume to continue download";
+                            w.status_label.set_text(status_msg);
+                            w.task.saved_status = status_msg.to_string();
                             w.speed_eta_label.set_text("Stopped");
-                            w.progress_bar.set_fraction(0.0);
-                            w.progress_bar.set_text(Some("Cancelled"));
+                            w.progress_bar.set_fraction(frac);
+                            if frac > 0.01 {
+                                w.progress_bar.set_text(Some(&format!(
+                                    "Stopped ({:.0}%) — Click Resume",
+                                    frac * 100.0
+                                )));
+                            } else {
+                                w.progress_bar.set_text(Some("Stopped — Click Resume"));
+                            }
                             w.cancel_btn.set_visible(false);
                             w.retry_btn.set_visible(true);
                             w.remove_btn.set_visible(true);
+                            updated = true;
+                        }
+                        if updated {
+                            persist_queue_state(&queue_rows_map);
                         }
                     }
                 }
@@ -1055,7 +1407,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                 None
             };
 
-            enqueue_download(url, initial_title, platform, preset, pl_items, None);
+            enqueue_download(url, initial_title, platform, preset, pl_items, None, None);
             url_entry.set_text("");
         })
     };
@@ -1100,8 +1452,8 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                 &win,
                 url,
                 current_settings,
-                move |u, t, p, preset, pl, expected_count| {
-                    enqueue_cb(u, t, p, preset, pl, expected_count);
+                move |u, t, p, preset, pl, expected_count, thumb_url| {
+                    enqueue_cb(u, t, p, preset, pl, expected_count, thumb_url);
                     entry_to_clear.set_text("");
                 },
             );
@@ -1372,9 +1724,11 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
             let win_clone = win.clone();
             let force_close_confirmed = force_close_confirmed.clone();
             let close_dialog_open = close_dialog_open.clone();
+            let queue_rows_for_close = queue_rows_map.clone();
             dialog.connect_response(None, move |_, response| {
                 close_dialog_open.set(false);
                 if response == "quit" {
+                    persist_queue_state(&queue_rows_for_close);
                     downloader::cancel_all_tasks();
                     force_close_confirmed.set(true);
                     win_clone.close();
@@ -1394,6 +1748,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
 
 fn build_queue_row_widgets(
     task: &DownloadTask,
+    restored_stopped: bool,
     queue_list_box: &gtk::Box,
     queue_stack: &gtk::Stack,
     queue_stack_page: &adw::ViewStackPage,
@@ -1426,8 +1781,13 @@ fn build_queue_row_widgets(
     quality_badge.set_ellipsize(gtk::pango::EllipsizeMode::End);
     quality_badge.set_width_chars(1);
 
+    // Videos already finished in previous runs of this task (restored from `queue.json`)
+    let already_done = task.completed_files.len() as u32;
     let initial_pl_badge_text = if initial_playlist_total > 0 {
-        format!("0 of {} Videos • 0 Done", initial_playlist_total)
+        format!(
+            "{} of {} Videos • {} Done",
+            already_done, initial_playlist_total, already_done
+        )
     } else {
         "Playlist".to_string()
     };
@@ -1443,31 +1803,53 @@ fn build_queue_row_widgets(
 
     let cancel_btn = gtk::Button::builder()
         .icon_name("process-stop-symbolic")
-        .tooltip_text("Cancel Download")
+        .tooltip_text("Stop Download")
+        .visible(!restored_stopped)
         .valign(gtk::Align::Center)
         .build();
     cancel_btn.add_css_class("destructive-action");
 
     let retry_btn = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
-        .tooltip_text("Retry Download")
-        .visible(false)
+        .tooltip_text("Resume / Retry Download")
+        .visible(restored_stopped)
         .valign(gtk::Align::Center)
         .build();
+    retry_btn.add_css_class("suggested-action");
 
     let remove_btn = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
         .tooltip_text("Remove from Queue")
-        .visible(false)
+        .visible(restored_stopped)
         .valign(gtk::Align::Center)
         .build();
 
+    let link_btn = build_link_button(&task.url);
+
     header_row.append(&badges_box);
+    header_row.append(&link_btn);
     header_row.append(&retry_btn);
     header_row.append(&remove_btn);
     header_row.append(&cancel_btn);
 
-    // Title label on its own full-width line with WordChar wrapping so narrow screens never clip it
+    // Body row: Thumbnail preview on the left + Title/Progress/Status on the right
+    let body_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    body_row.set_margin_start(12);
+    body_row.set_margin_end(12);
+    body_row.set_margin_bottom(10);
+
+    // Thumbnail with a placeholder icon as backup whenever the image is missing/not downloaded yet
+    let (thumb_frame, thumb_stack, thumb_picture) =
+        build_thumbnail_widget(112, 64, task.preset.is_audio());
+
+    if let Some(existing_thumb) = task.resolved_thumbnail_path() {
+        load_thumbnail_file_into_widgets(&existing_thumb, &thumb_picture, &thumb_stack);
+    }
+
+    let details_vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    details_vbox.set_hexpand(true);
+
+    // Title label with WordChar wrapping so narrow screens never clip it
     let display_title = if is_playlist_task
         && !task.title.starts_with("Playlist:")
         && !task.title.starts_with("Fetching")
@@ -1487,8 +1869,6 @@ fn build_queue_row_widgets(
     title_label.set_lines(2);
     title_label.set_width_chars(1);
     title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title_label.set_margin_start(12);
-    title_label.set_margin_end(12);
 
     // Current video label (shown for playlists so user sees the exact video title and index being downloaded)
     let current_video_label = gtk::Label::new(Some("Preparing playlist items..."));
@@ -1500,41 +1880,65 @@ fn build_queue_row_widgets(
     current_video_label.set_lines(2);
     current_video_label.set_width_chars(1);
     current_video_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    current_video_label.set_margin_start(12);
-    current_video_label.set_margin_end(12);
     current_video_label.set_visible(is_playlist_task);
 
     // Overall Playlist Progress Bar (shown above the current video progress bar for playlists)
     let playlist_progress_bar = gtk::ProgressBar::new();
     playlist_progress_bar.set_show_text(true);
     playlist_progress_bar.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    playlist_progress_bar.set_fraction(0.0);
+    let initial_pl_frac = if initial_playlist_total > 0 {
+        (already_done as f64 / initial_playlist_total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    playlist_progress_bar.set_fraction(initial_pl_frac);
     playlist_progress_bar.set_text(Some(&if initial_playlist_total > 0 {
         format!(
-            "Overall Playlist: 0 / {} Done ({} Left) — 0%",
-            initial_playlist_total, initial_playlist_total
+            "Overall Playlist: {} / {} Done ({} Left) — {:.0}%",
+            already_done,
+            initial_playlist_total,
+            initial_playlist_total.saturating_sub(already_done),
+            initial_pl_frac * 100.0
         )
     } else {
         "Overall Playlist: Queued...".to_string()
     }));
-    playlist_progress_bar.set_margin_start(12);
-    playlist_progress_bar.set_margin_end(12);
     playlist_progress_bar.set_visible(is_playlist_task);
+
+    let initial_frac = if restored_stopped {
+        task.saved_fraction.clamp(0.0, 0.99)
+    } else {
+        0.0
+    };
+    let initial_prog_text = if restored_stopped {
+        if initial_frac > 0.01 {
+            format!("Stopped ({:.0}%) — Click Resume", initial_frac * 100.0)
+        } else {
+            "Stopped — Click Resume".to_string()
+        }
+    } else {
+        "Queued...".to_string()
+    };
 
     let progress_bar = gtk::ProgressBar::new();
     progress_bar.set_show_text(true);
     progress_bar.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    progress_bar.set_fraction(0.0);
-    progress_bar.set_text(Some("Queued..."));
-    progress_bar.set_margin_start(12);
-    progress_bar.set_margin_end(12);
+    progress_bar.set_fraction(initial_frac);
+    progress_bar.set_text(Some(&initial_prog_text));
 
     let bottom_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    bottom_box.set_margin_bottom(10);
-    bottom_box.set_margin_start(12);
-    bottom_box.set_margin_end(12);
 
-    let status_label = gtk::Label::new(Some("Waiting in queue..."));
+    let initial_status_text = if restored_stopped {
+        if !task.saved_status.is_empty() && task.saved_status != "Waiting in queue..." {
+            task.saved_status.as_str()
+        } else {
+            "Stopped — Click Resume to continue download"
+        }
+    } else {
+        "Waiting in queue..."
+    };
+
+    let status_label = gtk::Label::new(Some(initial_status_text));
     status_label.add_css_class("dim-label");
     status_label.set_halign(gtk::Align::Start);
     status_label.set_xalign(0.0);
@@ -1543,7 +1947,12 @@ fn build_queue_row_widgets(
     status_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     status_label.set_width_chars(1);
 
-    let speed_eta_label = gtk::Label::new(Some("-- MB/s • ETA --:--"));
+    let initial_speed_text = if restored_stopped {
+        "Stopped"
+    } else {
+        "-- MB/s • ETA --:--"
+    };
+    let speed_eta_label = gtk::Label::new(Some(initial_speed_text));
     speed_eta_label.add_css_class("dim-label");
     speed_eta_label.set_halign(gtk::Align::Start);
     speed_eta_label.set_xalign(0.0);
@@ -1554,30 +1963,64 @@ fn build_queue_row_widgets(
     bottom_box.append(&status_label);
     bottom_box.append(&speed_eta_label);
 
+    details_vbox.append(&title_label);
+    details_vbox.append(&current_video_label);
+    details_vbox.append(&playlist_progress_bar);
+    details_vbox.append(&progress_bar);
+    details_vbox.append(&bottom_box);
+
+    body_row.append(&thumb_frame);
+    body_row.append(&details_vbox);
+
     card.append(&header_row);
-    card.append(&title_label);
-    card.append(&current_video_label);
-    card.append(&playlist_progress_bar);
-    card.append(&progress_bar);
-    card.append(&bottom_box);
+    card.append(&body_row);
 
     let task_id = task.id;
-    cancel_btn.connect_clicked(move |_| {
-        downloader::cancel_task(task_id);
-    });
+    {
+        let queue_rows_map = queue_rows_map.clone();
+        cancel_btn.connect_clicked(move |_| {
+            downloader::cancel_task(task_id);
+            let mut updated = false;
+            if let Some(w) = queue_rows_map.borrow_mut().get_mut(&task_id) {
+                let frac = w.progress_bar.fraction().max(w.task.saved_fraction);
+                w.task.saved_fraction = frac;
+                let status_msg = "Stopped — Click Resume to continue download";
+                w.status_label.set_text(status_msg);
+                w.task.saved_status = status_msg.to_string();
+                w.speed_eta_label.set_text("Stopped");
+                if frac > 0.01 {
+                    w.progress_bar
+                        .set_text(Some(&format!("Stopped ({:.0}%) — Click Resume", frac * 100.0)));
+                } else {
+                    w.progress_bar.set_text(Some("Stopped — Click Resume"));
+                }
+                w.cancel_btn.set_visible(false);
+                w.retry_btn.set_visible(true);
+                w.remove_btn.set_visible(true);
+                updated = true;
+            }
+            if updated {
+                persist_queue_state(&queue_rows_map);
+            }
+        });
+    }
 
     {
         let queue_rows_map = queue_rows_map.clone();
         let job_queue_tx = job_queue_tx.clone();
         retry_btn.connect_clicked(move |_| {
+            downloader::remove_cancel_token(task_id);
             let maybe_task = {
                 let mut map_borrow = queue_rows_map.borrow_mut();
                 if let Some(w) = map_borrow.get_mut(&task_id) {
                     w.playlist_current_idx = 0;
-                    w.playlist_completed_count = 0;
-                    w.status_label.set_text("Re-queued...");
-                    w.progress_bar.set_fraction(0.0);
-                    w.progress_bar.set_text(Some("Queued..."));
+                    // Keep the count of videos already finished in previous runs
+                    w.playlist_completed_count = w.task.completed_files.len() as u32;
+                    w.status_label.set_text("Resuming download...");
+                    w.task.saved_status = "Resuming download...".to_string();
+                    let resume_frac = w.task.saved_fraction.clamp(0.02, 0.99);
+                    w.progress_bar.set_fraction(resume_frac);
+                    w.progress_bar.set_text(Some("Resuming..."));
                     w.playlist_progress_bar.set_fraction(0.0);
                     w.cancel_btn.set_visible(true);
                     w.retry_btn.set_visible(false);
@@ -1588,6 +2031,12 @@ fn build_queue_row_widgets(
                 }
             };
             if let Some(t) = maybe_task {
+                persist_queue_state(&queue_rows_map);
+                if t.resolved_thumbnail_path().is_none() {
+                    if let Some(ref url) = t.thumbnail_url {
+                        fetch_and_apply_task_thumbnail(task_id, url.clone(), queue_rows_map.clone());
+                    }
+                }
                 let _ = job_queue_tx.send_blocking(t);
             }
         });
@@ -1600,10 +2049,13 @@ fn build_queue_row_widgets(
         let queue_stack_page = queue_stack_page.clone();
 
         remove_btn.connect_clicked(move |_| {
+            downloader::cancel_task(task_id);
             let removed = queue_rows_map.borrow_mut().remove(&task_id);
             if let Some(w) = removed {
+                metadata::delete_task_thumbnail(task_id, w.task.thumbnail_path.as_deref());
                 queue_list_box.remove(&w.card);
             }
+            persist_queue_state(&queue_rows_map);
             let remaining = queue_rows_map.borrow().len();
             queue_stack_page.set_badge_number(remaining as u32);
             if remaining == 0 {
@@ -1614,6 +2066,8 @@ fn build_queue_row_widgets(
 
     QueueRowWidgets {
         card,
+        thumb_stack,
+        thumb_picture,
         playlist_badge,
         title_label,
         current_video_label,
@@ -1627,11 +2081,15 @@ fn build_queue_row_widgets(
         task: task.clone(),
         playlist_current_idx: 0,
         playlist_total: initial_playlist_total,
-        playlist_completed_count: 0,
+        playlist_completed_count: task.completed_files.len() as u32,
     }
 }
 
-fn build_completed_item_card(item: &CompletedItem) -> gtk::Box {
+fn build_completed_item_card(
+    item: &CompletedItem,
+    history_rc: &Rc<RefCell<Vec<CompletedItem>>>,
+    refresh_holder: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     card.add_css_class("card");
 
@@ -1684,11 +2142,114 @@ fn build_completed_item_card(item: &CompletedItem) -> gtk::Box {
         let _ = open::that(&folder_path);
     });
 
+    let link_btn = build_link_button(&item.url);
+
+    let remove_btn = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Remove from History (the downloaded file is kept)")
+        .build();
+    {
+        let history_rc = history_rc.clone();
+        let refresh_holder = refresh_holder.clone();
+        let item_id = item.id;
+        let item_path = item.file_path.clone();
+        remove_btn.connect_clicked(move |_| {
+            CompletedItem::remove_and_save(&mut history_rc.borrow_mut(), item_id, &item_path);
+            let refresh = refresh_holder.borrow().clone();
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+        });
+    }
+
     btns_box.append(&open_file_btn);
     btns_box.append(&open_folder_btn);
+    btns_box.append(&link_btn);
+    btns_box.append(&remove_btn);
 
     top_row.append(&badges_row);
     top_row.append(&btns_box);
+
+    // Body row: thumbnail (with placeholder backup) + title & file path
+    let body_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    body_row.set_margin_start(12);
+    body_row.set_margin_end(12);
+    body_row.set_margin_bottom(10);
+
+    let badge_lower = item.quality_badge.to_lowercase();
+    let is_audio = badge_lower.contains("mp3")
+        || badge_lower.contains("m4a")
+        || badge_lower.contains("audio")
+        || badge_lower.contains("opus");
+    let (thumb_frame, thumb_stack, thumb_picture) = build_thumbnail_widget(96, 54, is_audio);
+
+    let loaded_local = item
+        .resolved_thumbnail_path()
+        .map(|p| load_thumbnail_file_into_widgets(&p, &thumb_picture, &thumb_stack))
+        .unwrap_or(false);
+
+    // Backup: if the local image is missing or corrupt, re-download it from the saved thumbnail URL.
+    // If that also fails (offline / URL expired) the placeholder icon stays visible.
+    if !loaded_local {
+        if let Some(url) = item
+            .thumbnail_url
+            .clone()
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        {
+            let dest = item
+                .thumbnail_path
+                .clone()
+                .filter(|p| p.starts_with(metadata::thumbnails_dir()))
+                .unwrap_or_else(|| metadata::new_history_thumbnail_file_path(item.id));
+            let item_id = item.id;
+            let item_path = item.file_path.clone();
+            let history_rc = history_rc.clone();
+            let pic_weak = thumb_picture.downgrade();
+            let stack_weak = thumb_stack.downgrade();
+
+            glib::MainContext::default().spawn_local(async move {
+                let Ok(saved) = updater::fetch_and_save_thumbnail_to(dest, &url).await else {
+                    return;
+                };
+                let mut final_path = saved.clone();
+                let mut still_in_history = false;
+                {
+                    let mut hist = history_rc.borrow_mut();
+                    if let Some(entry) = hist
+                        .iter_mut()
+                        .find(|h| h.id == item_id && h.file_path == item_path)
+                    {
+                        still_in_history = true;
+                        match entry.resolved_thumbnail_path() {
+                            // Another refresh already restored a different file: keep that one
+                            Some(existing) if existing != saved => {
+                                metadata::delete_thumbnail_file(Some(&saved));
+                                final_path = existing;
+                            }
+                            _ => {
+                                entry.thumbnail_path = Some(saved.clone());
+                            }
+                        }
+                    }
+                    if still_in_history {
+                        CompletedItem::save_history(&hist);
+                    }
+                }
+                if !still_in_history {
+                    // Entry was removed/pruned while downloading: don't leave an orphan file
+                    metadata::delete_thumbnail_file(Some(&saved));
+                    return;
+                }
+                if let (Some(pic), Some(stack)) = (pic_weak.upgrade(), stack_weak.upgrade()) {
+                    load_thumbnail_file_into_widgets(&final_path, &pic, &stack);
+                }
+            });
+        }
+    }
+
+    let details_vbox = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    details_vbox.set_hexpand(true);
+    details_vbox.set_valign(gtk::Align::Center);
 
     let title_label = gtk::Label::new(Some(&item.title));
     title_label.add_css_class("heading");
@@ -1700,8 +2261,6 @@ fn build_completed_item_card(item: &CompletedItem) -> gtk::Box {
     title_label.set_lines(2);
     title_label.set_width_chars(1);
     title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title_label.set_margin_start(12);
-    title_label.set_margin_end(12);
 
     let path_label = gtk::Label::new(Some(&item.file_path.to_string_lossy()));
     path_label.add_css_class("dim-label");
@@ -1713,12 +2272,14 @@ fn build_completed_item_card(item: &CompletedItem) -> gtk::Box {
     path_label.set_lines(2);
     path_label.set_width_chars(1);
     path_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    path_label.set_margin_start(12);
-    path_label.set_margin_end(12);
-    path_label.set_margin_bottom(10);
+
+    details_vbox.append(&title_label);
+    details_vbox.append(&path_label);
+
+    body_row.append(&thumb_frame);
+    body_row.append(&details_vbox);
 
     card.append(&top_row);
-    card.append(&title_label);
-    card.append(&path_label);
+    card.append(&body_row);
     card
 }

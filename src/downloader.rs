@@ -16,17 +16,25 @@ static CANCEL_TOKENS: Lazy<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn register_cancel_token(task_id: u64) -> Arc<AtomicBool> {
-    let token = Arc::new(AtomicBool::new(false));
     if let Ok(mut map) = CANCEL_TOKENS.lock() {
+        if let Some(existing) = map.get(&task_id) {
+            if existing.load(Ordering::SeqCst) {
+                return existing.clone();
+            }
+        }
+        let token = Arc::new(AtomicBool::new(false));
         map.insert(task_id, token.clone());
+        return token;
     }
-    token
+    Arc::new(AtomicBool::new(false))
 }
 
 pub fn cancel_task(task_id: u64) {
-    if let Ok(map) = CANCEL_TOKENS.lock() {
+    if let Ok(mut map) = CANCEL_TOKENS.lock() {
         if let Some(token) = map.get(&task_id) {
             token.store(true, Ordering::SeqCst);
+        } else {
+            map.insert(task_id, Arc::new(AtomicBool::new(true)));
         }
     }
 }
@@ -151,6 +159,7 @@ pub fn apply_bypass_and_network_args(
 ) {
     args.push("--encoding".to_string());
     args.push("utf-8".to_string());
+    args.push("--continue".to_string());
     args.push("--no-colors".to_string());
     args.push("--geo-bypass".to_string());
     args.push("--no-check-certificates".to_string());
@@ -702,6 +711,11 @@ pub fn execute_download_task_blocking(
     sender: async_channel::Sender<DownloadProgressEvent>,
 ) {
     let cancel_token = register_cancel_token(task.id);
+    if cancel_token.load(Ordering::SeqCst) {
+        remove_cancel_token(task.id);
+        let _ = sender.send_blocking(DownloadProgressEvent::Cancelled { task_id: task.id });
+        return;
+    }
     let _ = std::fs::create_dir_all(&task.output_dir);
 
     let _ = sender.send_blocking(DownloadProgressEvent::Started {
@@ -804,11 +818,13 @@ fn run_single_download_attempt(
         relax_constraints,
     );
 
-    // Print markers so we can capture playlist item metadata, exact title, and final file path reliably
+    // Print markers so we can capture playlist item metadata, exact title, thumbnail, and final file path reliably
     args.push("--print".to_string());
     args.push("video:__ARV_ITEM__:%(playlist_index)s|||%(n_entries)s|||%(playlist_count)s|||%(playlist_title)s|||%(title)s".to_string());
     args.push("--print".to_string());
     args.push("before_dl:__ARV_TITLE__:%(title)s".to_string());
+    args.push("--print".to_string());
+    args.push("before_dl:__ARV_THUMB__:%(thumbnail)s".to_string());
     args.push("--print".to_string());
     args.push("after_move:__ARV_FILEPATH__:%(filepath)s".to_string());
     args.push(task.url.clone());
@@ -982,6 +998,18 @@ fn run_single_download_attempt(
                         title: clean_title,
                     });
                 }
+            }
+            continue;
+        }
+
+        // 4b. Detect thumbnail URL right before download starts
+        if let Some(thumb) = trimmed.strip_prefix("__ARV_THUMB__:") {
+            let clean_thumb = thumb.trim();
+            if clean_thumb.starts_with("http://") || clean_thumb.starts_with("https://") {
+                let _ = sender.send_blocking(DownloadProgressEvent::ThumbnailUpdated {
+                    task_id: task.id,
+                    thumbnail_url: clean_thumb.to_string(),
+                });
             }
             continue;
         }

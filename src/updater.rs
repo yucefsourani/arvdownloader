@@ -35,6 +35,18 @@ pub async fn fetch_bytes_with_soup(url: &str) -> Result<glib::Bytes, String> {
     session.set_user_agent(metadata::HTTP_USER_AGENT);
     session.set_timeout(30);
 
+    let normalized_url = metadata::normalize_thumbnail_url(url);
+    if let Ok(msg) = soup::Message::new("GET", &normalized_url) {
+        if let Ok(bytes) = session
+            .send_and_read_future(&msg, glib::Priority::DEFAULT)
+            .await
+        {
+            if is_status_success(msg.status()) && !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+    }
+
     let msg = soup::Message::new("GET", url).map_err(|e| format!("Invalid URL: {}", e))?;
     let bytes = session
         .send_and_read_future(&msg, glib::Priority::DEFAULT)
@@ -47,6 +59,69 @@ pub async fn fetch_bytes_with_soup(url: &str) -> Result<glib::Bytes, String> {
     }
 
     Ok(bytes)
+}
+
+/// Downloads a video thumbnail into the dedicated `thumbnails_dir()` (`task_<id>.jpg`),
+/// converting WebP/AVIF formats via `ffmpeg` if needed so GTK4 can always render it.
+pub async fn fetch_and_save_task_thumbnail(
+    task_id: u64,
+    url: &str,
+) -> Result<std::path::PathBuf, String> {
+    fetch_and_save_thumbnail_to(metadata::task_thumbnail_file_path(task_id), url).await
+}
+
+/// Downloads a thumbnail image from `url` and stores it as a decodable JPEG/PNG at `dest_path`
+/// (inside `thumbnails_dir()`), converting via `ffmpeg` if GDK cannot decode the raw bytes.
+pub async fn fetch_and_save_thumbnail_to(
+    dest_path: std::path::PathBuf,
+    url: &str,
+) -> Result<std::path::PathBuf, String> {
+    let _ = std::fs::create_dir_all(metadata::thumbnails_dir());
+
+    let bytes = fetch_bytes_with_soup(url).await?;
+    let raw_vec = bytes.to_vec();
+
+    // If GDK Texture can decode the bytes directly, write directly to dest_path
+    if gtk::gdk::Texture::from_bytes(&bytes).is_ok() {
+        let dest_clone = dest_path.clone();
+        gio::spawn_blocking(move || std::fs::write(&dest_clone, &raw_vec))
+            .await
+            .map_err(|_| "Thumbnail write task panicked".to_string())?
+            .map_err(|e| format!("Failed saving thumbnail: {}", e))?;
+        return Ok(dest_path);
+    }
+
+    // Fallback: write raw bytes and convert to standard JPEG using managed ffmpeg
+    let raw_temp = dest_path.with_extension("raw");
+    let dest_clone = dest_path.clone();
+    gio::spawn_blocking(move || -> Result<(), String> {
+        std::fs::write(&raw_temp, &raw_vec)
+            .map_err(|e| format!("Failed writing raw thumbnail: {}", e))?;
+        let ffmpeg_bin = if metadata::managed_ffmpeg_path().exists() {
+            metadata::managed_ffmpeg_path()
+        } else {
+            std::path::PathBuf::from(metadata::ffmpeg_bin_name())
+        };
+        let mut cmd = std::process::Command::new(&ffmpeg_bin);
+        cmd.arg("-y")
+            .arg("-i")
+            .arg(&raw_temp)
+            .arg("-vframes")
+            .arg("1")
+            .arg(&dest_clone);
+        crate::downloader::configure_command_platform(&mut cmd);
+        let _ = cmd.output();
+        let _ = std::fs::remove_file(&raw_temp);
+        if dest_clone.exists() {
+            Ok(())
+        } else {
+            Err("Could not convert thumbnail to JPEG".to_string())
+        }
+    })
+    .await
+    .map_err(|_| "Thumbnail conversion task panicked".to_string())??;
+
+    Ok(dest_path)
 }
 
 /// Runs the startup & manual update workflow for `yt-dlp`, `ffmpeg`, and `deno`.

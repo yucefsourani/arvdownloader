@@ -823,7 +823,7 @@ pub enum DownloadStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadTask {
     pub id: u64,
     pub url: String,
@@ -833,6 +833,88 @@ pub struct DownloadTask {
     pub output_dir: PathBuf,
     pub playlist_items: Option<String>,
     pub expected_playlist_count: Option<u32>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub thumbnail_path: Option<PathBuf>,
+    #[serde(default)]
+    pub saved_fraction: f64,
+    #[serde(default)]
+    pub saved_status: String,
+    /// Files of playlist videos already finished (and added to Completed History) by this task.
+    /// Persisted in `queue.json` so stopping/resuming never duplicates history entries.
+    #[serde(default)]
+    pub completed_files: Vec<PathBuf>,
+}
+
+impl DownloadTask {
+    /// Returns the existing local thumbnail file path on disk (checking `thumbnail_path` first,
+    /// then the deterministic `thumbnails_dir()/task_<id>.jpg` path).
+    pub fn resolved_thumbnail_path(&self) -> Option<PathBuf> {
+        if let Some(ref custom) = self.thumbnail_path {
+            if custom.is_file() {
+                return Some(custom.clone());
+            }
+        }
+        let standard = metadata::task_thumbnail_file_path(self.id);
+        if standard.is_file() {
+            return Some(standard);
+        }
+        None
+    }
+
+    pub fn load_saved_queue() -> Vec<Self> {
+        let path = metadata::queue_file_path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let clean = content.trim_start_matches('\u{feff}');
+            if let Ok(mut list) = serde_json::from_str::<Vec<DownloadTask>>(clean) {
+                for task in &mut list {
+                    let expected_thumb = metadata::task_thumbnail_file_path(task.id);
+                    if expected_thumb.exists() {
+                        task.thumbnail_path = Some(expected_thumb);
+                    } else if let Some(ref p) = task.thumbnail_path {
+                        if !p.exists() {
+                            task.thumbnail_path = None;
+                        }
+                    }
+                }
+                return list;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn save_queue(tasks: &[Self]) {
+        let path = metadata::queue_file_path();
+        if let Ok(content) = serde_json::to_string_pretty(tasks) {
+            let _ = std::fs::write(path, content);
+        }
+    }
+
+    /// Removes any leftover files in `thumbnails_dir()` that belong neither to an active/saved
+    /// queue item nor to a Completed History item.
+    pub fn cleanup_orphan_thumbnails(active_tasks: &[Self], history: &[CompletedItem]) {
+        let thumb_dir = metadata::thumbnails_dir();
+        let Ok(entries) = std::fs::read_dir(&thumb_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            if !file_path.is_file() {
+                continue;
+            }
+            let keep_queue = active_tasks.iter().any(|t| {
+                metadata::task_thumbnail_file_path(t.id) == file_path
+                    || t.thumbnail_path.as_deref() == Some(file_path.as_path())
+            });
+            let keep_history = history
+                .iter()
+                .any(|h| h.thumbnail_path.as_deref() == Some(file_path.as_path()));
+            if !keep_queue && !keep_history {
+                let _ = std::fs::remove_file(&file_path);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -844,6 +926,10 @@ pub enum DownloadProgressEvent {
     TitleUpdated {
         task_id: u64,
         title: String,
+    },
+    ThumbnailUpdated {
+        task_id: u64,
+        thumbnail_url: String,
     },
     PlaylistDetected {
         task_id: u64,
@@ -903,22 +989,90 @@ pub struct CompletedItem {
     pub quality_badge: String,
     pub file_path: PathBuf,
     pub completed_at: String,
+    /// Original remote thumbnail URL (backup used to re-download the image if the local file is missing)
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    /// Local thumbnail file stored in `thumbnails_dir()` (`history_<id>_<millis>.jpg`)
+    #[serde(default)]
+    pub thumbnail_path: Option<PathBuf>,
 }
 
 impl CompletedItem {
     pub const MAX_HISTORY_ROWS: usize = 10;
 
+    /// Returns the local thumbnail path only if the file still exists on disk
+    pub fn resolved_thumbnail_path(&self) -> Option<PathBuf> {
+        self.thumbnail_path
+            .as_ref()
+            .filter(|p| p.is_file())
+            .cloned()
+    }
+
+    /// Deletes this history item's thumbnail file from `thumbnails_dir()`
+    pub fn delete_thumbnail(&self) {
+        metadata::delete_thumbnail_file(self.thumbnail_path.as_deref());
+    }
+
     /// 1. Removes any history entry whose file no longer exists on disk (`file_path.exists()`).
     /// 2. If more than `MAX_HISTORY_ROWS` (10) entries remain, deletes the oldest entries
     ///    so only the 10 most recent existing items are kept.
+    ///
+    /// The thumbnail files of every removed entry are deleted from `thumbnails_dir()`.
     pub fn prune_missing_and_cap(items: &mut Vec<Self>) -> bool {
         let initial_len = items.len();
-        items.retain(|item| item.file_path.exists());
-        if items.len() > Self::MAX_HISTORY_ROWS {
-            let excess = items.len() - Self::MAX_HISTORY_ROWS;
-            items.drain(0..excess);
+        let mut removed: Vec<Self> = Vec::new();
+        let mut kept: Vec<Self> = Vec::with_capacity(items.len());
+        for item in items.drain(..) {
+            if item.file_path.exists() {
+                kept.push(item);
+            } else {
+                removed.push(item);
+            }
+        }
+        if kept.len() > Self::MAX_HISTORY_ROWS {
+            let excess = kept.len() - Self::MAX_HISTORY_ROWS;
+            removed.extend(kept.drain(0..excess));
+        }
+        *items = kept;
+
+        for old in &removed {
+            let still_used = old.thumbnail_path.is_some()
+                && items
+                    .iter()
+                    .any(|i| i.thumbnail_path.is_some() && i.thumbnail_path == old.thumbnail_path);
+            if !still_used {
+                old.delete_thumbnail();
+            }
         }
         items.len() != initial_len
+    }
+
+    /// Explicitly removes a single history entry (matched by id + file path) and deletes its thumbnail
+    pub fn remove_and_save(items: &mut Vec<Self>, id: u64, file_path: &std::path::Path) {
+        Self::remove_entry(items, id, file_path);
+        Self::save_history(items);
+    }
+
+    /// Removes a single entry (matched by id + file path) from memory and deletes its thumbnail file
+    pub fn remove_entry(items: &mut Vec<Self>, id: u64, file_path: &std::path::Path) -> bool {
+        if let Some(pos) = items
+            .iter()
+            .position(|i| i.id == id && i.file_path == file_path)
+        {
+            let removed = items.remove(pos);
+            removed.delete_thumbnail();
+            return true;
+        }
+        false
+    }
+
+    /// Explicitly clears the whole history and deletes all history thumbnails
+    pub fn clear_and_save(items: &mut Vec<Self>) {
+        for item in items.iter() {
+            item.delete_thumbnail();
+        }
+        items.clear();
+        Self::save_history(items);
     }
 
     pub fn load_history() -> Vec<Self> {
@@ -944,9 +1098,45 @@ impl CompletedItem {
     }
 
     pub fn push_and_save(items: &mut Vec<Self>, new_item: Self) {
-        items.push(new_item);
+        Self::upsert(items, new_item);
         Self::prune_missing_and_cap(items);
         Self::save_history(items);
+    }
+
+    /// Adds `new_item` as the newest entry. If an entry for the same file already exists
+    /// (e.g. a resumed playlist re-reporting a finished video, or the same video downloaded
+    /// again to the same file) the old entry is replaced instead of duplicated, keeping its
+    /// thumbnail when the new entry has none.
+    pub fn upsert(items: &mut Vec<Self>, mut new_item: Self) {
+        let same_file = |a: &std::path::Path, b: &std::path::Path| {
+            if a == b {
+                return true;
+            }
+            match (a.canonicalize(), b.canonicalize()) {
+                (Ok(ca), Ok(cb)) => ca == cb,
+                _ => false,
+            }
+        };
+        let mut idx = 0;
+        while idx < items.len() {
+            if same_file(&items[idx].file_path, &new_item.file_path) {
+                let old = items.remove(idx);
+                if new_item.resolved_thumbnail_path().is_none() {
+                    if let Some(old_thumb) = old.resolved_thumbnail_path() {
+                        new_item.thumbnail_path = Some(old_thumb);
+                    }
+                    if new_item.thumbnail_url.is_none() {
+                        new_item.thumbnail_url = old.thumbnail_url.clone();
+                    }
+                }
+                if old.thumbnail_path.is_some() && old.thumbnail_path != new_item.thumbnail_path {
+                    old.delete_thumbnail();
+                }
+            } else {
+                idx += 1;
+            }
+        }
+        items.push(new_item);
     }
 
     pub fn save_history(items: &[Self]) {
@@ -1025,6 +1215,8 @@ mod tests {
                 quality_badge: "1080p MP4".to_string(),
                 file_path: temp_dir.join(format!("missing_{}.mp4", i)),
                 completed_at: "Completed".to_string(),
+                thumbnail_url: None,
+                thumbnail_path: None,
             });
         }
 
@@ -1032,6 +1224,8 @@ mod tests {
         for i in 1..=13 {
             let fp = temp_dir.join(format!("existing_{}.mp4", i));
             let _ = std::fs::write(&fp, b"video");
+            let thumb = metadata::new_history_thumbnail_file_path(900_000 + i);
+            let _ = std::fs::write(&thumb, b"jpg");
             list.push(CompletedItem {
                 id: 100 + i,
                 title: format!("Existing {}", i),
@@ -1040,8 +1234,14 @@ mod tests {
                 quality_badge: "1080p MP4".to_string(),
                 file_path: fp,
                 completed_at: "Completed".to_string(),
+                thumbnail_url: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".to_string()),
+                thumbnail_path: Some(thumb),
             });
         }
+        let oldest_thumbs: Vec<PathBuf> = list[3..6]
+            .iter()
+            .filter_map(|i| i.thumbnail_path.clone())
+            .collect();
 
         let changed = CompletedItem::prune_missing_and_cap(&mut list);
         assert!(changed);
@@ -1049,7 +1249,116 @@ mod tests {
         // Should keep items 4..=13 (the 10 newest existing files)
         assert_eq!(list.first().unwrap().title, "Existing 4");
         assert_eq!(list.last().unwrap().title, "Existing 13");
+        for t in &oldest_thumbs {
+            assert!(!t.exists(), "Thumbnails of pruned oldest items must be deleted");
+        }
+        for item in &list {
+            assert!(item.resolved_thumbnail_path().is_some(), "Kept items keep thumbnails");
+        }
+
+        // Explicit removal of one row deletes only its thumbnail
+        let first = list[0].clone();
+        CompletedItem::remove_entry(&mut list, first.id, &first.file_path);
+        assert_eq!(list.len(), 9);
+        assert!(!first.thumbnail_path.unwrap().exists());
+
+        // Explicit clear deletes all thumbnails
+        let remaining: Vec<PathBuf> = list.iter().filter_map(|i| i.thumbnail_path.clone()).collect();
+        for item in list.iter() {
+            item.delete_thumbnail();
+        }
+        list.clear();
+        for t in remaining {
+            assert!(!t.exists());
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_history_upsert_prevents_duplicates_on_resume() {
+        let temp_dir = std::env::temp_dir().join("arv_history_upsert_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let fp = temp_dir.join("video_1.mp4");
+        std::fs::write(&fp, b"video").unwrap();
+        let other = temp_dir.join("video_2.mp4");
+        std::fs::write(&other, b"video").unwrap();
+
+        let thumb = metadata::new_history_thumbnail_file_path(777_001);
+        std::fs::write(&thumb, b"jpg").unwrap();
+
+        let make = |id: u64, path: &PathBuf, thumb: Option<PathBuf>| CompletedItem {
+            id,
+            title: format!("Item {}", id),
+            url: "https://www.youtube.com/playlist?list=PL123".to_string(),
+            platform: "YouTube".to_string(),
+            quality_badge: "1080p MP4".to_string(),
+            file_path: path.clone(),
+            completed_at: "Completed".to_string(),
+            thumbnail_url: Some("https://i.ytimg.com/vi/a/hqdefault.jpg".to_string()),
+            thumbnail_path: thumb,
+        };
+
+        let mut list = Vec::new();
+        CompletedItem::upsert(&mut list, make(1001, &fp, Some(thumb.clone())));
+        CompletedItem::upsert(&mut list, make(1002, &other, None));
+        // Resume re-reports the first video with a new id and no local thumbnail
+        CompletedItem::upsert(&mut list, make(5001, &fp, None));
+
+        assert_eq!(list.len(), 2, "Same file must not be duplicated in history");
+        assert_eq!(list.last().unwrap().id, 5001);
+        assert_eq!(
+            list.last().unwrap().thumbnail_path.as_ref(),
+            Some(&thumb),
+            "Existing thumbnail should be kept for the replaced entry"
+        );
+        assert!(thumb.exists());
+
+        let _ = std::fs::remove_file(&thumb);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_queue_persistence_and_thumbnail_cleanup() {
+        let task_id = 999_888_777_u64;
+        let thumb_path = metadata::task_thumbnail_file_path(task_id);
+        std::fs::write(&thumb_path, b"fake_jpg_bytes").unwrap();
+        assert!(thumb_path.is_file());
+
+        let task = DownloadTask {
+            id: task_id,
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            title: "Test Resumable Video".to_string(),
+            platform: "YouTube".to_string(),
+            preset: QualityPreset::Video1080p,
+            output_dir: metadata::default_download_dir(),
+            playlist_items: None,
+            expected_playlist_count: None,
+            thumbnail_url: Some(
+                "https://i.ytimg.com/vi_webp/dQw4w9WgXcQ/maxresdefault.webp".to_string(),
+            ),
+            thumbnail_path: Some(thumb_path.clone()),
+            saved_fraction: 0.42,
+            saved_status: "Stopped — Click Resume to continue download".to_string(),
+            completed_files: Vec::new(),
+        };
+
+        assert_eq!(
+            metadata::normalize_thumbnail_url(task.thumbnail_url.as_ref().unwrap()),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"
+        );
+        assert_eq!(task.resolved_thumbnail_path(), Some(thumb_path.clone()));
+
+        let json = serde_json::to_string(&vec![task]).unwrap();
+        let restored: Vec<DownloadTask> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, task_id);
+        assert!((restored[0].saved_fraction - 0.42).abs() < 1e-6);
+
+        metadata::delete_task_thumbnail(task_id, restored[0].thumbnail_path.as_deref());
+        assert!(
+            !thumb_path.exists(),
+            "Thumbnail file in thumbnails/ folder should be deleted on completion or removal"
+        );
     }
 }

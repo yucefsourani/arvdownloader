@@ -97,6 +97,77 @@ pub fn staging_dir() -> PathBuf {
     normalize_path(&staging)
 }
 
+/// Returns the dedicated directory used to store active queue thumbnails:
+/// `~/.arvdownloader/thumbnails` (Linux) or `%LOCALAPPDATA%\arvdownloader\thumbnails` (Windows)
+pub fn thumbnails_dir() -> PathBuf {
+    let dir = app_home_dir().join("thumbnails");
+    let _ = std::fs::create_dir_all(&dir);
+    normalize_path(&dir)
+}
+
+/// Returns the deterministic file path for a queue task's saved thumbnail inside `thumbnails_dir()`
+pub fn task_thumbnail_file_path(task_id: u64) -> PathBuf {
+    thumbnails_dir().join(format!("task_{}.jpg", task_id))
+}
+
+/// Deletes the saved thumbnail file(s) for a queue task when its download finishes or its row is removed
+pub fn delete_task_thumbnail(task_id: u64, custom_path: Option<&Path>) {
+    let default_thumb = task_thumbnail_file_path(task_id);
+    if default_thumb.exists() {
+        let _ = std::fs::remove_file(&default_thumb);
+    }
+    let raw_thumb = thumbnails_dir().join(format!("task_{}.raw", task_id));
+    if raw_thumb.exists() {
+        let _ = std::fs::remove_file(&raw_thumb);
+    }
+    if let Some(p) = custom_path {
+        if p.exists() && p.starts_with(thumbnails_dir()) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Returns a new unique file path for a Completed History item's thumbnail inside `thumbnails_dir()`
+/// (`history_<id>_<unix_millis>.jpg`). The timestamp guarantees uniqueness across app sessions
+/// even if task ids restart from 1.
+pub fn new_history_thumbnail_file_path(item_id: u64) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut candidate = thumbnails_dir().join(format!("history_{}_{}.jpg", item_id, millis));
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate =
+            thumbnails_dir().join(format!("history_{}_{}_{}.jpg", item_id, millis, suffix));
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Deletes a thumbnail file only if it lives inside the dedicated `thumbnails_dir()` folder
+pub fn delete_thumbnail_file(path: Option<&Path>) {
+    if let Some(p) = path {
+        if p.is_file() && p.starts_with(thumbnails_dir()) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Converts YouTube `vi_webp/.../*.webp` thumbnail URLs to standard JPEG URLs so GTK4/GDK-Pixbuf
+/// can decode them natively on both Windows and Linux even without external WebP loaders.
+pub fn normalize_thumbnail_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.contains("ytimg.com/vi_webp/") {
+        let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+        let replaced = without_query.replace("/vi_webp/", "/vi/");
+        if let Some(stem) = replaced.strip_suffix(".webp") {
+            return format!("{}.jpg", stem);
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Returns the path to `versions.json` inside `managed_bin_dir()`
 pub fn versions_file_path() -> PathBuf {
     managed_bin_dir().join("versions.json")
@@ -110,6 +181,11 @@ pub fn config_file_path() -> PathBuf {
 /// Returns the path to `history.json` inside `app_home_dir()`
 pub fn history_file_path() -> PathBuf {
     app_home_dir().join("history.json")
+}
+
+/// Returns the path to `queue.json` inside `app_home_dir()` for persisting incomplete/stopped queue rows
+pub fn queue_file_path() -> PathBuf {
+    app_home_dir().join("queue.json")
 }
 
 /// Platform-aware binary filename for `yt-dlp`
