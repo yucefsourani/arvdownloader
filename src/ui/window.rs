@@ -33,8 +33,19 @@ struct QueueRowWidgets {
     playlist_completed_count: u32,
 }
 
+pub fn apply_theme(dark_theme: bool) {
+    let style_manager = adw::StyleManager::default();
+    if dark_theme {
+        style_manager.set_color_scheme(adw::ColorScheme::ForceDark);
+    } else {
+        style_manager.set_color_scheme(adw::ColorScheme::ForceLight);
+    }
+}
+
 pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     let settings_rc = Rc::new(RefCell::new(AppSettings::load()));
+    apply_theme(settings_rc.borrow().dark_theme);
+
     // Ensure saved cookie_source is valid/available on this system
     {
         let mut cfg = settings_rc.borrow_mut();
@@ -92,7 +103,10 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     let update_tools_btn = gtk::Button::builder()
         .icon_name("software-update-available-symbolic")
-        .tooltip_text("Check and update yt-dlp, ffmpeg, and deno in ~/.video_downloader/bin via libsoup3")
+        .tooltip_text(&format!(
+            "Check and update yt-dlp, ffmpeg, and deno in {}",
+            metadata::managed_bin_dir_display()
+        ))
         .valign(gtk::Align::Center)
         .build();
 
@@ -151,9 +165,10 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     updater_spinner.set_valign(gtk::Align::Center);
     updater_spinner.start();
 
-    let updater_status_label = gtk::Label::new(Some(
-        "Checking ~/.video_downloader/bin for yt-dlp, ffmpeg, and deno updates via libsoup3...",
-    ));
+    let updater_status_label = gtk::Label::new(Some(&format!(
+        "Checking {} for yt-dlp, ffmpeg, and deno updates...",
+        metadata::managed_bin_dir_display()
+    )));
     updater_status_label.set_halign(gtk::Align::Start);
     updater_status_label.set_xalign(0.0);
     updater_status_label.set_hexpand(true);
@@ -1213,9 +1228,10 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                             updater_progress_bar.set_visible(false);
                             update_tools_btn.set_sensitive(true);
 
-                            updater_status_label.set_text(
-                                "yt-dlp, ffmpeg, and deno ready in ~/.video_downloader/bin (Managed via libsoup3)",
-                            );
+                            updater_status_label.set_text(&format!(
+                                "yt-dlp, ffmpeg, and deno ready in {}",
+                                metadata::managed_bin_dir_display()
+                            ));
                             updater_versions_badge.set_text(&format!(
                                 "yt-dlp: {} • ffmpeg: {} • deno: {}",
                                 ytdlp_version, ffmpeg_version, deno_version
@@ -1334,9 +1350,11 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                 ),
                 (false, true) => (
                     "Tool Download in Progress",
-                    "Core media tools (yt-dlp, ffmpeg, or deno) are currently being downloaded into ~/.video_downloader/bin.\n\n\
-                     Closing arvdownloader now may leave the tool installation incomplete. Are you sure you want to quit?"
-                        .to_string(),
+                    format!(
+                        "Core media tools (yt-dlp, ffmpeg, or deno) are currently being downloaded into {}.\n\n\
+                         Closing arvdownloader now may leave the tool installation incomplete. Are you sure you want to quit?",
+                        metadata::managed_bin_dir_display()
+                    ),
                 ),
                 (false, false) => unreachable!(),
             };

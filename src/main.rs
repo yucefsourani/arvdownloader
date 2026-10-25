@@ -10,11 +10,36 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 
 fn main() -> glib::ExitCode {
-    // Windows DirectWrite/Pango/Vulkan crash mitigation
+    // Windows DirectWrite/Pango/Vulkan crash mitigation and GIO TLS / Pixbuf module environment setup
     #[cfg(windows)]
     {
         if std::env::var("GSK_RENDERER").is_err() {
             std::env::set_var("GSK_RENDERER", "gl");
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let gio_mods = parent.join("lib").join("gio").join("modules");
+                if gio_mods.exists() && std::env::var_os("GIO_MODULE_DIR").is_none() {
+                    std::env::set_var("GIO_MODULE_DIR", &gio_mods);
+                }
+                let ca_bundle = parent.join("ssl").join("certs").join("ca-bundle.crt");
+                if ca_bundle.exists() {
+                    if std::env::var_os("GTLS_SYSTEM_CA_FILE").is_none() {
+                        std::env::set_var("GTLS_SYSTEM_CA_FILE", &ca_bundle);
+                    }
+                    if std::env::var_os("SSL_CERT_FILE").is_none() {
+                        std::env::set_var("SSL_CERT_FILE", &ca_bundle);
+                    }
+                }
+                let pixbuf_cache = parent
+                    .join("lib")
+                    .join("gdk-pixbuf-2.0")
+                    .join("2.10.0")
+                    .join("loaders.cache");
+                if pixbuf_cache.exists() && std::env::var_os("GDK_PIXBUF_MODULE_FILE").is_none() {
+                    std::env::set_var("GDK_PIXBUF_MODULE_FILE", &pixbuf_cache);
+                }
+            }
         }
     }
 
@@ -23,6 +48,8 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|_| {
+        let settings = models::AppSettings::load();
+        ui::window::apply_theme(settings.dark_theme);
         register_app_icons();
         load_custom_css();
     });

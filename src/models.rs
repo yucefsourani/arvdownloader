@@ -220,52 +220,169 @@ impl BrowserCookieSource {
     }
 }
 
-fn resolve_firefox_cookie_spec(home: & std::path::Path) -> Option<String> {
+pub fn resolve_firefox_cookie_spec(home: &std::path::Path) -> Option<String> {
     let mut base_dirs = vec![
         home.join(".mozilla/firefox"),
         home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+        home.join(".var/app/org.mozilla.firefox/config/mozilla/firefox"),
         home.join("snap/firefox/common/.mozilla/firefox"),
         home.join(".config/mozilla/firefox"),
+        home.join("AppData/Roaming/Mozilla/Firefox/Profiles"),
+        home.join("AppData/Roaming/Mozilla/Firefox"),
+        home.join("AppData/Local/Mozilla/Firefox/Profiles"),
+        home.join("AppData/Local/Mozilla/Firefox"),
+        home.join("scoop/persist/firefox/profile"),
+        home.join("scoop/apps/firefox/current/profile"),
     ];
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        base_dirs.push(PathBuf::from(appdata).join("Mozilla/Firefox/Profiles"));
+
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let p = PathBuf::from(appdata);
+        base_dirs.push(p.join("Mozilla/Firefox/Profiles"));
+        base_dirs.push(p.join("Mozilla/Firefox"));
     }
 
-    let mut best_profile: Option<(PathBuf, std::time::SystemTime, u64)> = None;
+    let mut packages_roots = vec![home.join("AppData/Local/Packages")];
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        let p = PathBuf::from(local_appdata);
+        base_dirs.push(p.join("Mozilla/Firefox/Profiles"));
+        base_dirs.push(p.join("Mozilla/Firefox"));
+        packages_roots.push(p.join("Packages"));
+    }
 
-    for base in base_dirs {
-        if !base.exists() {
+    // Scan Windows Microsoft Store (MSIX) packages for Firefox (e.g. Mozilla.Firefox_n80bbvh6b1yt2)
+    for pkg_root in packages_roots {
+        append_ms_store_firefox_dirs(&pkg_root, &mut base_dirs);
+    }
+
+    resolve_firefox_cookie_spec_from_dirs(&base_dirs)
+}
+
+pub fn append_ms_store_firefox_dirs(pkg_root: &std::path::Path, base_dirs: &mut Vec<PathBuf>) {
+    if !pkg_root.exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(pkg_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let pkg_path = entry.path();
+        if !pkg_path.is_dir() {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
+        let folder_name = entry.file_name().to_string_lossy().to_lowercase();
+        if folder_name.contains("firefox") || folder_name.contains("mozilla") {
+            for rel in [
+                "LocalCache/Roaming/Mozilla/Firefox/Profiles",
+                "LocalCache/Roaming/Mozilla/Firefox",
+                "LocalCache/Local/Mozilla/Firefox/Profiles",
+                "LocalCache/Local/Mozilla/Firefox",
+                "RoamingState/Mozilla/Firefox/Profiles",
+                "RoamingState/Mozilla/Firefox",
+                "LocalState/Mozilla/Firefox/Profiles",
+                "LocalState/Mozilla/Firefox",
+            ] {
+                base_dirs.push(pkg_path.join(rel));
             }
-            let cookie_db = path.join("cookies.sqlite");
-            if let Ok(meta) = std::fs::metadata(&cookie_db) {
-                if meta.len() > 0 {
-                    let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    let len = meta.len();
-                    let should_replace = match &best_profile {
-                        None => true,
-                        Some((_, best_mod, best_len)) => {
-                            (modified, len) > (*best_mod, *best_len)
+        }
+    }
+}
+
+pub fn resolve_firefox_cookie_spec_from_dirs(base_dirs: &[PathBuf]) -> Option<String> {
+    let mut candidate_profiles = Vec::new();
+    for base in base_dirs {
+        if !base.exists() || !base.is_dir() {
+            continue;
+        }
+        candidate_profiles.push(base.clone());
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    candidate_profiles.push(path.clone());
+                    // Also check nested Profiles/ directory if `base` was `Mozilla/Firefox`
+                    if path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("Profiles"))
+                        .unwrap_or(false)
+                    {
+                        if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                            for sub in sub_entries.flatten() {
+                                let sub_path = sub.path();
+                                if sub_path.is_dir() {
+                                    candidate_profiles.push(sub_path);
+                                }
+                            }
                         }
-                    };
-                    if should_replace {
-                        best_profile = Some((path, modified, len));
                     }
                 }
             }
         }
     }
 
-    best_profile.map(|(profile_dir, _, _)| {
-        format!("firefox:{}", metadata::normalize_path(&profile_dir).to_string_lossy())
+    let mut best_profile: Option<(PathBuf, std::time::SystemTime, u64)> = None;
+    let mut fallback_profile: Option<(PathBuf, std::time::SystemTime)> = None;
+
+    for path in candidate_profiles {
+        let cookie_db = path.join("cookies.sqlite");
+        let cookie_wal = path.join("cookies.sqlite-wal");
+
+        let db_meta = std::fs::metadata(&cookie_db).ok();
+        let wal_meta = std::fs::metadata(&cookie_wal).ok();
+
+        let db_len = db_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let wal_len = wal_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let total_len = db_len.saturating_add(wal_len);
+
+        if total_len > 0 {
+            let db_mod = db_meta
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let wal_mod = wal_meta
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let modified = db_mod.max(wal_mod);
+
+            let should_replace = match &best_profile {
+                None => true,
+                Some((_, best_mod, best_len)) => (modified, total_len) > (*best_mod, *best_len),
+            };
+            if should_replace {
+                best_profile = Some((path, modified, total_len));
+            }
+            continue;
+        }
+
+        // Fallback for freshly installed Microsoft Store / Windows Firefox profile before first cookie write
+        let prefs_js = path.join("prefs.js");
+        let places_db = path.join("places.sqlite");
+        let marker_meta = db_meta
+            .or_else(|| std::fs::metadata(&prefs_js).ok())
+            .or_else(|| std::fs::metadata(&places_db).ok());
+
+        if let Some(meta) = marker_meta {
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let should_replace = match &fallback_profile {
+                None => true,
+                Some((_, best_mod)) => modified > *best_mod,
+            };
+            if should_replace {
+                fallback_profile = Some((path, modified));
+            }
+        }
+    }
+
+    if let Some((profile_dir, _, _)) = best_profile {
+        return Some(format!(
+            "firefox:{}",
+            metadata::normalize_path(&profile_dir).to_string_lossy()
+        ));
+    }
+
+    fallback_profile.map(|(profile_dir, _)| {
+        format!(
+            "firefox:{}",
+            metadata::normalize_path(&profile_dir).to_string_lossy()
+        )
     })
 }
 
@@ -417,6 +534,8 @@ pub struct AppSettings {
     pub check_updates_on_startup: bool,
     #[serde(default = "default_true")]
     pub use_managed_deno: bool,
+    #[serde(default = "default_true")]
+    pub dark_theme: bool,
 }
 
 impl Default for AppSettings {
@@ -433,6 +552,7 @@ impl Default for AppSettings {
             auto_bypass_fallbacks: true,
             check_updates_on_startup: true,
             use_managed_deno: true,
+            dark_theme: true,
         }
     }
 }
@@ -440,11 +560,29 @@ impl Default for AppSettings {
 impl AppSettings {
     pub fn load() -> Self {
         let path = metadata::config_file_path();
+        if !path.exists() {
+            if let Some(legacy_dir) = metadata::legacy_app_home_dir() {
+                let legacy_cfg = legacy_dir.join("config.json");
+                if legacy_cfg.exists() {
+                    let _ = std::fs::copy(&legacy_cfg, &path);
+                }
+            }
+        }
         if let Ok(data) = std::fs::read_to_string(&path) {
             let clean = data.trim_start_matches('\u{feff}');
             if let Ok(mut cfg) = serde_json::from_str::<AppSettings>(clean) {
-                let _ = std::fs::create_dir_all(&cfg.download_dir);
-                cfg.download_dir = metadata::normalize_path(&cfg.download_dir);
+                let is_legacy_omni = cfg
+                    .download_dir
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("omni");
+                if is_legacy_omni || cfg.download_dir.as_os_str().is_empty() {
+                    cfg.download_dir = metadata::default_download_dir();
+                    cfg.save();
+                } else {
+                    let _ = std::fs::create_dir_all(&cfg.download_dir);
+                    cfg.download_dir = metadata::normalize_path(&cfg.download_dir);
+                }
                 return cfg;
             }
         }
@@ -472,6 +610,14 @@ pub struct InstalledToolVersions {
 impl InstalledToolVersions {
     pub fn load() -> Self {
         let path = metadata::versions_file_path();
+        if !path.exists() {
+            if let Some(legacy_dir) = metadata::legacy_app_home_dir() {
+                let legacy_ver = legacy_dir.join("bin").join("versions.json");
+                if legacy_ver.exists() {
+                    let _ = std::fs::copy(&legacy_ver, &path);
+                }
+            }
+        }
         if let Ok(content) = std::fs::read_to_string(path) {
             let clean = content.trim_start_matches('\u{feff}');
             if let Ok(v) = serde_json::from_str::<InstalledToolVersions>(clean) {
@@ -777,6 +923,14 @@ impl CompletedItem {
 
     pub fn load_history() -> Vec<Self> {
         let path = metadata::history_file_path();
+        if !path.exists() {
+            if let Some(legacy_dir) = metadata::legacy_app_home_dir() {
+                let legacy_hist = legacy_dir.join("history.json");
+                if legacy_hist.exists() {
+                    let _ = std::fs::copy(&legacy_hist, &path);
+                }
+            }
+        }
         if let Ok(content) = std::fs::read_to_string(path) {
             let clean = content.trim_start_matches('\u{feff}');
             if let Ok(mut list) = serde_json::from_str::<Vec<CompletedItem>>(clean) {
@@ -808,8 +962,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_windows_ms_store_firefox_cookie_detection() {
+        let temp_root = std::env::temp_dir().join("arv_ms_store_firefox_test");
+        let _ = std::fs::remove_dir_all(&temp_root);
+
+        let pkg_root = temp_root.join("Packages");
+        let profile_dir = pkg_root
+            .join("Mozilla.Firefox_n80bbvh6b1yt2")
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Mozilla")
+            .join("Firefox")
+            .join("Profiles")
+            .join("abc12345.default-release");
+
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("cookies.sqlite"), b"SQLite format 3\0").unwrap();
+
+        let mut base_dirs = Vec::new();
+        append_ms_store_firefox_dirs(&pkg_root, &mut base_dirs);
+        let spec = resolve_firefox_cookie_spec_from_dirs(&base_dirs);
+
+        assert!(spec.is_some(), "Should detect Microsoft Store Firefox profile");
+        let spec_str = spec.unwrap();
+        assert!(spec_str.starts_with("firefox:"));
+        assert!(spec_str.contains("abc12345.default-release"));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn test_dark_theme_enabled_by_default_and_persisted() {
+        let default_settings = AppSettings::default();
+        assert!(
+            default_settings.dark_theme,
+            "Dark theme should be enabled by default"
+        );
+
+        let mut modified = default_settings.clone();
+        modified.dark_theme = false;
+        let json = serde_json::to_string(&modified).unwrap();
+        let restored: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(
+            !restored.dark_theme,
+            "Saved light theme state should be restored accurately"
+        );
+    }
+
+    #[test]
     fn test_history_prune_missing_and_cap_at_10() {
-        let temp_dir = std::env::temp_dir().join("omni_history_test");
+        let temp_dir = std::env::temp_dir().join("arv_history_test");
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let mut list = Vec::new();

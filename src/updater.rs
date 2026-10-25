@@ -49,25 +49,33 @@ pub async fn fetch_bytes_with_soup(url: &str) -> Result<glib::Bytes, String> {
     Ok(bytes)
 }
 
-/// Runs the startup & manual update workflow for `yt-dlp`, `ffmpeg`, and `deno` using `libsoup3`.
+/// Runs the startup & manual update workflow for `yt-dlp`, `ffmpeg`, and `deno`.
 ///
-/// 1. Ensures `~/.video_downloader/bin` exists.
-/// 2. On first launch, if bundled binaries exist next to the executable (`bundled_bin/`), copies them
-///    into `~/.video_downloader/bin` immediately.
-/// 3. Queries GitHub Releases via `libsoup3` for `yt-dlp`, `ffmpeg`, and `deno`.
-/// 4. Downloads any missing or newer versions into `~/.video_downloader/staging` with live progress bar updates,
-///    extracts archives (`zip` on Windows, `tar.xz` on Linux), and moves binaries to `~/.video_downloader/bin`.
+/// 1. Ensures `managed_bin_dir()` (`~/.arvdownloader/bin` on Linux, `%LOCALAPPDATA%\arvdownloader\bin` on Windows) exists.
+/// 2. If any tool (`yt-dlp`, `ffmpeg`, `ffprobe`, `deno`) is missing in `managed_bin_dir()`, checks if it exists
+///    alongside the executable (`bundled_bin/`, `bin/`, or executable folder) or in legacy `~/.video_downloader/bin`
+///    and moves it into `managed_bin_dir()`.
+/// 3. If the folder alongside the executable does not exist or any binary is still missing in `managed_bin_dir()`,
+///    downloads it from scratch from GitHub Releases into `managed_bin_dir()` (and updates existing binaries if newer).
 pub async fn run_tools_updater(
     sender: async_channel::Sender<ToolUpdateEvent>,
     force_reinstall: bool,
 ) {
+    let bin_display = metadata::managed_bin_dir_display();
+    let _ = std::fs::create_dir_all(metadata::app_home_dir());
+    let _ = std::fs::create_dir_all(metadata::managed_bin_dir());
+    let _ = std::fs::create_dir_all(metadata::staging_dir());
+
     let _ = sender
         .send(ToolUpdateEvent::Started {
-            message: "Initializing ~/.video_downloader/bin and checking yt-dlp, ffmpeg, and deno...".to_string(),
+            message: format!(
+                "Initializing {} and checking yt-dlp, ffmpeg, and deno...",
+                bin_display
+            ),
         })
         .await;
 
-    // Step 1: Seed from bundled directory on first launch if managed binaries are missing
+    // Step 1: Move binaries from alongside the executable (or legacy directory) if missing in managed_bin_dir
     if let Err(e) = seed_from_bundled_if_needed(&sender).await {
         let _ = sender
             .send(ToolUpdateEvent::Warning {
@@ -79,9 +87,10 @@ pub async fn run_tools_updater(
     let mut installed = InstalledToolVersions::load();
     let ytdlp_path = metadata::managed_ytdlp_path();
     let ffmpeg_path = metadata::managed_ffmpeg_path();
+    let ffprobe_path = metadata::managed_ffprobe_path();
     let deno_path = metadata::managed_deno_path();
 
-    // Detect local yt-dlp version if binary exists but versions.json was empty
+    // Detect local yt-dlp version if binary exists
     if installed.ytdlp_version.is_empty() && ytdlp_path.exists() {
         if let Some(ver) = query_local_ytdlp_version(&ytdlp_path).await {
             installed.ytdlp_version = ver;
@@ -89,7 +98,13 @@ pub async fn run_tools_updater(
         }
     }
 
-    // Detect local deno version if binary exists but versions.json was empty
+    // Mark local ffmpeg as installed if both ffmpeg and ffprobe binaries exist
+    if installed.ffmpeg_version.is_empty() && ffmpeg_path.exists() && ffprobe_path.exists() {
+        installed.ffmpeg_version = "latest".to_string();
+        installed.save();
+    }
+
+    // Detect local deno version if binary exists
     if installed.deno_version.is_empty() && deno_path.exists() {
         if let Some(ver) = query_local_deno_version(&deno_path).await {
             installed.deno_version = ver;
@@ -103,12 +118,12 @@ pub async fn run_tools_updater(
 
     let mut updated_any = false;
 
-    // Step 2: Check and update yt-dlp via libsoup3
+    // Step 2: Check and download/update yt-dlp
     let _ = sender
         .send(ToolUpdateEvent::Progress {
             tool_name: "yt-dlp".to_string(),
             fraction: 0.05,
-            status_text: "Checking GitHub for yt-dlp updates via libsoup3...".to_string(),
+            status_text: "Checking GitHub for yt-dlp updates...".to_string(),
         })
         .await;
 
@@ -118,11 +133,31 @@ pub async fn run_tools_updater(
         &["yt-dlp_linux", "yt-dlp"]
     };
 
-    match fetch_latest_github_release(&session, metadata::YTDLP_GITHUB_API, wanted_ytdlp_assets).await
-    {
+    let ytdlp_missing = !ytdlp_path.exists();
+    let ytdlp_release_res =
+        fetch_latest_github_release(&session, metadata::YTDLP_GITHUB_API, wanted_ytdlp_assets)
+            .await
+            .or_else(|api_err| {
+                if ytdlp_missing {
+                    Ok(ReleaseAssetInfo {
+                        tag_name: "latest".to_string(),
+                        download_url: if cfg!(windows) {
+                            metadata::YTDLP_DIRECT_WINDOWS_URL.to_string()
+                        } else {
+                            metadata::YTDLP_DIRECT_LINUX_URL.to_string()
+                        },
+                        asset_name: metadata::ytdlp_bin_name().to_string(),
+                        size_bytes: 0,
+                    })
+                } else {
+                    Err(api_err)
+                }
+            });
+
+    match ytdlp_release_res {
         Ok(release) => {
             let needs_ytdlp = force_reinstall
-                || !ytdlp_path.exists()
+                || ytdlp_missing
                 || installed.ytdlp_version != release.tag_name;
 
             if needs_ytdlp {
@@ -147,7 +182,14 @@ pub async fn run_tools_updater(
 
                         match move_res {
                             Ok(()) => {
-                                installed.ytdlp_version = release.tag_name;
+                                let resolved_ver = if release.tag_name == "latest" {
+                                    query_local_ytdlp_version(&ytdlp_path)
+                                        .await
+                                        .unwrap_or_else(|| "latest".to_string())
+                                } else {
+                                    release.tag_name
+                                };
+                                installed.ytdlp_version = resolved_ver;
                                 installed.save();
                                 updated_any = true;
                             }
@@ -163,7 +205,7 @@ pub async fn run_tools_updater(
                     Err(e) => {
                         let _ = sender
                             .send(ToolUpdateEvent::Warning {
-                                message: format!("Could not download yt-dlp update: {}", e),
+                                message: format!("Could not download yt-dlp: {}", e),
                             })
                             .await;
                     }
@@ -179,12 +221,12 @@ pub async fn run_tools_updater(
         }
     }
 
-    // Step 3: Check and update ffmpeg & ffprobe via libsoup3
+    // Step 3: Check and download/update ffmpeg & ffprobe
     let _ = sender
         .send(ToolUpdateEvent::Progress {
             tool_name: "ffmpeg".to_string(),
-            fraction: 0.50,
-            status_text: "Checking GitHub for ffmpeg updates via libsoup3...".to_string(),
+            fraction: 0.45,
+            status_text: "Checking GitHub for ffmpeg updates...".to_string(),
         })
         .await;
 
@@ -202,14 +244,35 @@ pub async fn run_tools_updater(
         ]
     };
 
-    // If on Linux and system ffmpeg is available while user hasn't downloaded managed ffmpeg yet,
-    // we still download/manage it in ~/.video_downloader/bin as requested, with fallback to system if offline.
-    match fetch_latest_github_release(&session, metadata::FFMPEG_GITHUB_API, wanted_ffmpeg_assets)
-        .await
-    {
+    let ffmpeg_missing = !ffmpeg_path.exists() || !ffprobe_path.exists();
+    let ffmpeg_release_res =
+        fetch_latest_github_release(&session, metadata::FFMPEG_GITHUB_API, wanted_ffmpeg_assets)
+            .await
+            .or_else(|api_err| {
+                if ffmpeg_missing {
+                    Ok(ReleaseAssetInfo {
+                        tag_name: "latest".to_string(),
+                        download_url: if cfg!(windows) {
+                            metadata::FFMPEG_DIRECT_WINDOWS_URL.to_string()
+                        } else {
+                            metadata::FFMPEG_DIRECT_LINUX_URL.to_string()
+                        },
+                        asset_name: if cfg!(windows) {
+                            "ffmpeg-master-latest-win64-gpl.zip".to_string()
+                        } else {
+                            "ffmpeg-master-latest-linux64-gpl.tar.xz".to_string()
+                        },
+                        size_bytes: 0,
+                    })
+                } else {
+                    Err(api_err)
+                }
+            });
+
+    match ffmpeg_release_res {
         Ok(release) => {
             let needs_ffmpeg = force_reinstall
-                || !ffmpeg_path.exists()
+                || ffmpeg_missing
                 || installed.ffmpeg_version != release.tag_name;
 
             if needs_ffmpeg {
@@ -228,10 +291,11 @@ pub async fn run_tools_updater(
                         let _ = sender
                             .send(ToolUpdateEvent::Progress {
                                 tool_name: "ffmpeg".to_string(),
-                                fraction: 0.92,
-                                status_text:
-                                    "Extracting ffmpeg and ffprobe and moving to ~/.video_downloader/bin..."
-                                        .to_string(),
+                                fraction: 0.90,
+                                status_text: format!(
+                                    "Extracting ffmpeg and ffprobe and moving to {}...",
+                                    bin_display
+                                ),
                             })
                             .await;
 
@@ -262,7 +326,7 @@ pub async fn run_tools_updater(
                     Err(e) => {
                         let _ = sender
                             .send(ToolUpdateEvent::Warning {
-                                message: format!("Could not download ffmpeg update: {}", e),
+                                message: format!("Could not download ffmpeg: {}", e),
                             })
                             .await;
                     }
@@ -278,18 +342,18 @@ pub async fn run_tools_updater(
         }
     }
 
-    // Step 4: Check and update `deno` in ~/.video_downloader/bin via libsoup3
-    // - If `use_managed_deno` is enabled (default = true): check GitHub Releases for deno and download/update in `~/.video_downloader/bin`.
-    // - If `use_managed_deno` is disabled: prioritize system PATH binaries, only downloading deno if no system JS runtime exists.
+    // Step 4: Check and download/update `deno` in managed_bin_dir
     let settings = AppSettings::load();
-    let should_manage_deno = settings.use_managed_deno || !has_any_js_runtime().await;
+    let deno_missing = !deno_path.exists();
+    let should_manage_deno =
+        settings.use_managed_deno || force_reinstall || deno_missing || !has_any_js_runtime().await;
 
     if should_manage_deno {
         let _ = sender
             .send(ToolUpdateEvent::Progress {
                 tool_name: "deno".to_string(),
                 fraction: 0.72,
-                status_text: "Checking GitHub for deno updates via libsoup3...".to_string(),
+                status_text: "Checking GitHub for deno updates...".to_string(),
             })
             .await;
 
@@ -299,12 +363,34 @@ pub async fn run_tools_updater(
             &["deno-x86_64-unknown-linux-gnu.zip"]
         };
 
-        match fetch_latest_github_release(&session, metadata::DENO_GITHUB_API, wanted_deno_assets)
-            .await
-        {
+        let deno_release_res =
+            fetch_latest_github_release(&session, metadata::DENO_GITHUB_API, wanted_deno_assets)
+                .await
+                .or_else(|api_err| {
+                    if deno_missing {
+                        Ok(ReleaseAssetInfo {
+                            tag_name: "latest".to_string(),
+                            download_url: if cfg!(windows) {
+                                metadata::DENO_DIRECT_WINDOWS_URL.to_string()
+                            } else {
+                                metadata::DENO_DIRECT_LINUX_URL.to_string()
+                            },
+                            asset_name: if cfg!(windows) {
+                                "deno-x86_64-pc-windows-msvc.zip".to_string()
+                            } else {
+                                "deno-x86_64-unknown-linux-gnu.zip".to_string()
+                            },
+                            size_bytes: 0,
+                        })
+                    } else {
+                        Err(api_err)
+                    }
+                });
+
+        match deno_release_res {
             Ok(release) => {
                 let needs_deno = force_reinstall
-                    || !deno_path.exists()
+                    || deno_missing
                     || installed.deno_version != release.tag_name;
 
                 if needs_deno {
@@ -324,9 +410,10 @@ pub async fn run_tools_updater(
                                 .send(ToolUpdateEvent::Progress {
                                     tool_name: "deno".to_string(),
                                     fraction: 0.96,
-                                    status_text:
-                                        "Extracting deno and moving to ~/.video_downloader/bin..."
-                                            .to_string(),
+                                    status_text: format!(
+                                        "Extracting deno and moving to {}...",
+                                        bin_display
+                                    ),
                                 })
                                 .await;
 
@@ -341,7 +428,14 @@ pub async fn run_tools_updater(
 
                             match extract_res {
                                 Ok(()) => {
-                                    installed.deno_version = release.tag_name;
+                                    let resolved_ver = if release.tag_name == "latest" {
+                                        query_local_deno_version(&deno_path)
+                                            .await
+                                            .unwrap_or_else(|| "latest".to_string())
+                                    } else {
+                                        release.tag_name
+                                    };
+                                    installed.deno_version = resolved_ver;
                                     installed.save();
                                     updated_any = true;
                                 }
@@ -357,7 +451,7 @@ pub async fn run_tools_updater(
                         Err(e) => {
                             let _ = sender
                                 .send(ToolUpdateEvent::Warning {
-                                    message: format!("Could not download deno update: {}", e),
+                                    message: format!("Could not download deno: {}", e),
                                 })
                                 .await;
                         }
@@ -382,7 +476,10 @@ pub async fn run_tools_updater(
     if !ytdlp_ok {
         let _ = sender
             .send(ToolUpdateEvent::Error {
-                message: "yt-dlp binary is missing in ~/.video_downloader/bin. Please check your internet connection and click Update Tools.".to_string(),
+                message: format!(
+                    "yt-dlp binary is missing in {}. Please check your internet connection and click Update Tools.",
+                    bin_display
+                ),
             })
             .await;
         return;
@@ -420,15 +517,20 @@ pub async fn run_tools_updater(
         .await;
 }
 
-/// On first launch (especially on Windows where `yt-dlp.exe` and `ffmpeg.exe` may be bundled in `bundled_bin/`),
-/// copies them into `~/.video_downloader/bin` before checking for online updates.
+/// Checks if `yt-dlp`, `ffmpeg`, `ffprobe`, or `deno` exist in any folder alongside the executable
+/// (`bundled_bin/`, `bin/`, or executable directory) or in legacy `~/.video_downloader/bin`,
+/// and moves them into `managed_bin_dir()` if they are not already present there.
+/// If the folder alongside the executable does not exist or does not contain the binaries,
+/// returns `Ok(())` so the updater downloads them from scratch.
 async fn seed_from_bundled_if_needed(
     sender: &async_channel::Sender<ToolUpdateEvent>,
 ) -> Result<(), String> {
-    let Some(bundled_dir) = metadata::bundled_bin_dir() else {
+    let candidate_dirs = metadata::candidate_bundled_bin_dirs();
+    if candidate_dirs.is_empty() {
         return Ok(());
-    };
+    }
 
+    let bin_display = metadata::managed_bin_dir_display();
     let tools = [
         (metadata::ytdlp_bin_name(), metadata::managed_ytdlp_path()),
         (metadata::ffmpeg_bin_name(), metadata::managed_ffmpeg_path()),
@@ -439,38 +541,50 @@ async fn seed_from_bundled_if_needed(
         (metadata::deno_bin_name(), metadata::managed_deno_path()),
     ];
 
-    let use_managed_deno = AppSettings::load().use_managed_deno;
     for (name, dest_path) in tools {
-        if name == metadata::deno_bin_name() && !use_managed_deno {
+        if dest_path.exists() {
             continue;
         }
-        if !dest_path.exists() {
-            let src_path = bundled_dir.join(name);
-            if src_path.exists() && src_path != dest_path {
+        for dir in &candidate_dirs {
+            let src_path = dir.join(name);
+            if src_path.exists() && src_path.is_file() && src_path != dest_path {
                 let _ = sender
                     .send(ToolUpdateEvent::Progress {
                         tool_name: name.to_string(),
                         fraction: 0.02,
-                        status_text: format!(
-                            "First run: copying bundled {} to ~/.video_downloader/bin...",
-                            name
-                        ),
+                        status_text: format!("Moving {} to {}...", name, bin_display),
                     })
                     .await;
 
                 let src_clone = src_path.clone();
                 let dest_clone = dest_path.clone();
                 gio::spawn_blocking(move || -> Result<(), String> {
-                    std::fs::copy(&src_clone, &dest_clone)
-                        .map_err(|e| format!("Failed copying {:?}: {}", src_clone, e))?;
+                    if let Some(parent) = dest_clone.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // Prefer moving the executable; if rename fails (e.g. across drives or read-only dir), copy then try removing source
+                    if std::fs::rename(&src_clone, &dest_clone).is_err() {
+                        std::fs::copy(&src_clone, &dest_clone)
+                            .map_err(|e| format!("Failed copying {:?}: {}", src_clone, e))?;
+                        let _ = std::fs::remove_file(&src_clone);
+                    }
                     set_executable_permissions(&dest_clone)?;
                     Ok(())
                 })
                 .await
-                .map_err(|_| "Seed copy task failed".to_string())??;
+                .map_err(|_| "Seed move/copy task failed".to_string())??;
+                break;
             }
         }
     }
+
+    // Clean up legacy `~/.video_downloader` folder if present so it no longer clutters Home
+    if let Some(legacy_dir) = metadata::legacy_app_home_dir() {
+        if legacy_dir != metadata::app_home_dir() {
+            let _ = std::fs::remove_dir_all(&legacy_dir);
+        }
+    }
+
     Ok(())
 }
 
@@ -536,7 +650,7 @@ async fn fetch_latest_github_release(
 }
 
 /// Streams a binary download in chunks using `soup3::Session::send_future` and `InputStreamExt::read_bytes_future`,
-/// updating the GTK ProgressBar at most once every 100ms.
+/// updating the GTK ProgressBar at most once every 100ms. If `libsoup3` fails, automatically falls back to `curl -L`.
 async fn download_file_with_soup_progress(
     session: &soup::Session,
     url: &str,
@@ -549,6 +663,31 @@ async fn download_file_with_soup_progress(
         let _ = std::fs::create_dir_all(parent);
     }
 
+    match download_file_soup_inner(session, url, dest_file, fallback_size, tool_name, sender).await {
+        Ok(()) => Ok(()),
+        Err(soup_err) => {
+            let _ = sender
+                .send(ToolUpdateEvent::Progress {
+                    tool_name: tool_name.to_string(),
+                    fraction: 0.35,
+                    status_text: format!("Downloading {} (fallback downloader)...", tool_name),
+                })
+                .await;
+            download_file_with_curl_fallback(url, dest_file)
+                .await
+                .map_err(|curl_err| format!("{} (fallback: {})", soup_err, curl_err))
+        }
+    }
+}
+
+async fn download_file_soup_inner(
+    session: &soup::Session,
+    url: &str,
+    dest_file: &Path,
+    fallback_size: u64,
+    tool_name: &str,
+    sender: &async_channel::Sender<ToolUpdateEvent>,
+) -> Result<(), String> {
     let msg =
         soup::Message::new("GET", url).map_err(|e| format!("Invalid download URL: {}", e))?;
 
@@ -631,7 +770,35 @@ async fn download_file_with_soup_progress(
     Ok(())
 }
 
-/// Atomically installs a downloaded single binary into `~/.video_downloader/bin` and sets `+x` permissions.
+async fn download_file_with_curl_fallback(url: &str, dest_file: &Path) -> Result<(), String> {
+    let url_str = url.to_string();
+    let dest_path = dest_file.to_path_buf();
+    gio::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+        cmd.arg("-L")
+            .arg("--fail")
+            .arg("--silent")
+            .arg("--show-error")
+            .arg("-A")
+            .arg(metadata::HTTP_USER_AGENT)
+            .arg("-o")
+            .arg(&dest_path)
+            .arg(&url_str);
+        crate::downloader::configure_command_platform(&mut cmd);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("curl fallback failed to launch: {}", e))?;
+        if !out.status.success() {
+            let err_txt = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("curl exited with {}: {}", out.status, err_txt));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "curl fallback task panicked".to_string())?
+}
+
+/// Atomically installs a downloaded single binary into `managed_bin_dir()` and sets `+x` permissions.
 fn install_binary_atomically(staging_file: &Path, target_path: &Path) -> Result<(), String> {
     if let Some(parent) = target_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -653,7 +820,7 @@ fn install_binary_atomically(staging_file: &Path, target_path: &Path) -> Result<
     Ok(())
 }
 
-/// Extracts `ffmpeg` and `ffprobe` from `.zip` (Windows) or `.tar.xz` (Linux) and moves them into `~/.video_downloader/bin`.
+/// Extracts `ffmpeg` and `ffprobe` from `.zip` (Windows) or `.tar.xz` (Linux) and moves them into `managed_bin_dir()`.
 fn extract_and_install_ffmpeg(archive_path: &Path, bin_dir: &Path) -> Result<(), String> {
     let name_lossy = archive_path.to_string_lossy().to_lowercase();
     let ffmpeg_name = metadata::ffmpeg_bin_name();
@@ -804,7 +971,7 @@ async fn query_local_deno_version(deno_path: &Path) -> Option<String> {
     .flatten()
 }
 
-/// Checks if `deno` is in `~/.video_downloader/bin` or if any supported JS runtime (`deno`, `node`, `qjs`, `bun`) is in PATH.
+/// Checks if `deno` is in `managed_bin_dir()` or if any supported JS runtime (`deno`, `node`, `qjs`, `bun`) is in PATH.
 async fn has_any_js_runtime() -> bool {
     if metadata::managed_deno_path().exists() {
         return true;

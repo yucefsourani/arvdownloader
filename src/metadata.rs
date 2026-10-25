@@ -8,52 +8,106 @@ pub const APP_DEVELOPER: &str = "Yucef Sourani";
 pub const APP_WEBSITE: &str = "https://github.com/yucefsourani/arvdownloader";
 pub const APP_ISSUE_URL: &str = "https://github.com/yucefsourani/arvdownloader/issues";
 pub const ICON_NAME: &str = "com.github.yucefsourani.arvdownloader";
-pub const ICON_FILE_PNG: &str = "data/icons/app_icon.png";
+pub const ICON_FILE_PNG: &str = "data/icons/com.github.yucefsourani.arvdownloader.png";
 pub const ICON_FILE_ICO: &str = "data/icons/icon.ico";
 
-/// Folder created inside the user's Home Directory (`~/.video_downloader` or `%USERPROFILE%\.video_downloader`)
-pub const HOME_DATA_DIR_NAME: &str = ".video_downloader";
+/// Hidden folder created inside the user's Home Directory on Linux (`~/.arvdownloader`)
+pub const LINUX_DATA_DIR_NAME: &str = ".arvdownloader";
+
+/// Folder created inside `%LOCALAPPDATA%` on Windows (`%LOCALAPPDATA%\arvdownloader`)
+pub const WINDOWS_DATA_DIR_NAME: &str = "arvdownloader";
+
+/// Legacy folder name from older versions used for automatic one-time migration
+pub const LEGACY_DATA_DIR_NAME: &str = ".video_downloader";
 
 pub const YTDLP_GITHUB_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 pub const FFMPEG_GITHUB_API: &str =
     "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest";
 pub const DENO_GITHUB_API: &str = "https://api.github.com/repos/denoland/deno/releases/latest";
+
+pub const YTDLP_DIRECT_LINUX_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
+pub const YTDLP_DIRECT_WINDOWS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+pub const FFMPEG_DIRECT_LINUX_URL: &str =
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz";
+pub const FFMPEG_DIRECT_WINDOWS_URL: &str =
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip";
+pub const DENO_DIRECT_LINUX_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
+pub const DENO_DIRECT_WINDOWS_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
+
 pub const HTTP_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0 arvdownloader/0.1.0";
 
-/// Returns the base directory inside the user's home directory: `~/.video_downloader`
+/// Returns the platform-appropriate application data directory:
+/// - **Linux**: `~/.arvdownloader` (hidden folder in user's Home directory)
+/// - **Windows**: `%LOCALAPPDATA%\arvdownloader` (inside hidden `AppData\Local`, avoiding visible folders in `%USERPROFILE%`)
 pub fn app_home_dir() -> PathBuf {
-    let home = glib::home_dir();
-    let dir = home.join(HOME_DATA_DIR_NAME);
-    let _ = std::fs::create_dir_all(&dir);
-    normalize_path(&dir)
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| glib::user_data_dir());
+        let dir = base.join(WINDOWS_DATA_DIR_NAME);
+        let _ = std::fs::create_dir_all(&dir);
+        return normalize_path(&dir);
+    }
+    #[cfg(not(windows))]
+    {
+        let home = glib::home_dir();
+        let dir = home.join(LINUX_DATA_DIR_NAME);
+        let _ = std::fs::create_dir_all(&dir);
+        normalize_path(&dir)
+    }
 }
 
-/// Returns the managed binary directory inside the user's home directory: `~/.video_downloader/bin`
+/// Returns the legacy `~/.video_downloader` path if it exists on disk (for one-time migration)
+pub fn legacy_app_home_dir() -> Option<PathBuf> {
+    let legacy = glib::home_dir().join(LEGACY_DATA_DIR_NAME);
+    if legacy.exists() {
+        Some(normalize_path(&legacy))
+    } else {
+        None
+    }
+}
+
+/// Human-friendly display label for the managed binary directory
+pub fn managed_bin_dir_display() -> &'static str {
+    if cfg!(windows) {
+        r"%LOCALAPPDATA%\arvdownloader\bin"
+    } else {
+        "~/.arvdownloader/bin"
+    }
+}
+
+/// Returns the managed binary directory: `~/.arvdownloader/bin` (Linux) or `%LOCALAPPDATA%\arvdownloader\bin` (Windows)
 pub fn managed_bin_dir() -> PathBuf {
     let bin = app_home_dir().join("bin");
     let _ = std::fs::create_dir_all(&bin);
     normalize_path(&bin)
 }
 
-/// Returns the staging directory used during downloads and archive extraction: `~/.video_downloader/staging`
+/// Returns the staging directory used during downloads and archive extraction
 pub fn staging_dir() -> PathBuf {
     let staging = app_home_dir().join("staging");
     let _ = std::fs::create_dir_all(&staging);
     normalize_path(&staging)
 }
 
-/// Returns the path to `versions.json` inside `~/.video_downloader/bin/versions.json`
+/// Returns the path to `versions.json` inside `managed_bin_dir()`
 pub fn versions_file_path() -> PathBuf {
     managed_bin_dir().join("versions.json")
 }
 
-/// Returns the path to `config.json` inside `~/.video_downloader/config.json`
+/// Returns the path to `config.json` inside `app_home_dir()`
 pub fn config_file_path() -> PathBuf {
     app_home_dir().join("config.json")
 }
 
-/// Returns the path to `history.json` inside `~/.video_downloader/history.json`
+/// Returns the path to `history.json` inside `app_home_dir()`
 pub fn history_file_path() -> PathBuf {
     app_home_dir().join("history.json")
 }
@@ -94,39 +148,50 @@ pub fn deno_bin_name() -> &'static str {
     }
 }
 
-/// Managed `yt-dlp` executable path in `~/.video_downloader/bin`
+/// Managed `yt-dlp` executable path in `managed_bin_dir()`
 pub fn managed_ytdlp_path() -> PathBuf {
     managed_bin_dir().join(ytdlp_bin_name())
 }
 
-/// Managed `ffmpeg` executable path in `~/.video_downloader/bin`
+/// Managed `ffmpeg` executable path in `managed_bin_dir()`
 pub fn managed_ffmpeg_path() -> PathBuf {
     managed_bin_dir().join(ffmpeg_bin_name())
 }
 
-/// Managed `ffprobe` executable path in `~/.video_downloader/bin`
+/// Managed `ffprobe` executable path in `managed_bin_dir()`
 pub fn managed_ffprobe_path() -> PathBuf {
     managed_bin_dir().join(ffprobe_bin_name())
 }
 
-/// Managed `deno` executable path in `~/.video_downloader/bin`
+/// Managed `deno` executable path in `managed_bin_dir()`
 pub fn managed_deno_path() -> PathBuf {
     managed_bin_dir().join(deno_bin_name())
 }
 
-/// Directory alongside the application executable where pre-bundled binaries may reside on Windows/Linux first run
-pub fn bundled_bin_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let parent = exe.parent()?;
-    let candidate = parent.join("bundled_bin");
-    if candidate.exists() {
-        return Some(normalize_path(&candidate));
+/// Returns all existing candidate directories where pre-bundled or legacy binaries may reside
+/// (`<exe_dir>/bundled_bin`, `<exe_dir>/bin`, `<exe_dir>`, and legacy `~/.video_downloader/bin`).
+pub fn candidate_bundled_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for sub in ["bundled_bin", "bin"] {
+                let candidate = parent.join(sub);
+                if candidate.exists() && candidate.is_dir() {
+                    dirs.push(normalize_path(&candidate));
+                }
+            }
+            if parent.exists() && parent.is_dir() {
+                dirs.push(normalize_path(parent));
+            }
+        }
     }
-    let alt_candidate = parent.join("bin");
-    if alt_candidate.exists() {
-        return Some(normalize_path(&alt_candidate));
+    if let Some(legacy_home) = legacy_app_home_dir() {
+        let legacy_bin = legacy_home.join("bin");
+        if legacy_bin.exists() && legacy_bin.is_dir() {
+            dirs.push(normalize_path(&legacy_bin));
+        }
     }
-    Some(normalize_path(parent))
+    dirs
 }
 
 /// Default output folder for downloaded videos/audio

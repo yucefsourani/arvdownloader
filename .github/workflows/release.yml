@@ -42,6 +42,8 @@ jobs:
             mingw-w64-ucrt-x86_64-gtk4
             mingw-w64-ucrt-x86_64-libadwaita
             mingw-w64-ucrt-x86_64-libsoup3
+            mingw-w64-ucrt-x86_64-glib-networking
+            mingw-w64-ucrt-x86_64-ca-certificates
             mingw-w64-ucrt-x86_64-librsvg
             mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-imagemagick
@@ -70,9 +72,9 @@ jobs:
           meson setup build --buildtype=release
           meson compile -C build
 
-      - name: Bundle Executable, Managed Binaries (yt-dlp/ffmpeg/deno), and GTK4 Runtime
+      - name: Bundle Executable and GTK4 + libsoup3 TLS Runtime
         run: |
-          mkdir -p dist/bundled_bin
+          mkdir -p dist
           cp "build/src/${BIN_NAME}.exe" dist/
           cp icon.ico dist/ || true
 
@@ -85,8 +87,15 @@ jobs:
           cp /ucrt64/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll dist/lib/gdk-pixbuf-2.0/2.10.0/loaders/ || true
           gdk-pixbuf-query-loaders > dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache || true
 
-          # Collect all required MSYS2 UCRT64 DLLs (GTK4, Libadwaita, libsoup3, GLib, Pango, Cairo, etc.)
-          ldd "dist/${BIN_NAME}.exe" dist/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll \
+          # Bundle GIO TLS modules (glib-networking) & CA certificates so libsoup3 HTTPS works on Windows
+          mkdir -p dist/lib/gio/modules
+          cp /ucrt64/lib/gio/modules/*.dll dist/lib/gio/modules/ || true
+          gio-querymodules dist/lib/gio/modules || true
+          mkdir -p dist/ssl/certs
+          cp /ucrt64/etc/ssl/certs/ca-bundle.crt dist/ssl/certs/ca-bundle.crt || cp /ucrt64/ssl/certs/ca-bundle.crt dist/ssl/certs/ca-bundle.crt || true
+
+          # Collect all required MSYS2 UCRT64 DLLs (GTK4, Libadwaita, libsoup3, GnuTLS, GLib, Pango, Cairo, etc.)
+          ldd "dist/${BIN_NAME}.exe" dist/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll dist/lib/gio/modules/*.dll \
             | grep '\/ucrt64.*\.dll' -o | sort -u | xargs -I{} cp -n {} dist/ || true
 
           cp -n /ucrt64/bin/vulkan-1.dll dist/ || true

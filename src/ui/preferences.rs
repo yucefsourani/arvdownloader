@@ -80,6 +80,30 @@ pub fn show_preferences_dialog<F, U>(
         .icon_name("emblem-system-symbolic")
         .build();
 
+    // 0. Appearance Group (Dark Theme enabled by default, persisted in config.json)
+    let appearance_group = adw::PreferencesGroup::builder()
+        .title("Appearance")
+        .description("Application color scheme and theme preference")
+        .build();
+
+    let dark_theme_switch = adw::SwitchRow::builder()
+        .title("Dark Theme")
+        .subtitle("Use dark color scheme by default (saved and restored on startup)")
+        .use_markup(false)
+        .active(settings_rc.borrow().dark_theme)
+        .build();
+
+    let settings_for_theme = settings_rc.clone();
+    dark_theme_switch.connect_active_notify(move |row| {
+        let is_dark = row.is_active();
+        crate::ui::window::apply_theme(is_dark);
+        let mut cfg = settings_for_theme.borrow_mut();
+        cfg.dark_theme = is_dark;
+        cfg.save();
+    });
+    appearance_group.add(&dark_theme_switch);
+    page.add(&appearance_group);
+
     // 1. Download Destination Group
     let dir_group = adw::PreferencesGroup::builder()
         .title("Download Location")
@@ -100,9 +124,23 @@ pub fn show_preferences_dialog<F, U>(
         .subtitle_lines(2)
         .build();
 
-    let choose_dir_btn = gtk::Button::builder()
+    let open_dir_btn = gtk::Button::builder()
         .icon_name("folder-open-symbolic")
-        .tooltip_text("Browse Output Folder")
+        .tooltip_text("Open Output Folder")
+        .valign(gtk::Align::Center)
+        .build();
+
+    let settings_for_open_dir = settings_rc.clone();
+    open_dir_btn.connect_clicked(move |_| {
+        let dir = settings_for_open_dir.borrow().download_dir.clone();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = open::that(&dir);
+    });
+
+    let choose_dir_btn = gtk::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .label("Change")
+        .tooltip_text("Change Output Folder")
         .valign(gtk::Align::Center)
         .build();
 
@@ -115,8 +153,13 @@ pub fn show_preferences_dialog<F, U>(
         let Some(win) = parent_weak.upgrade() else {
             return;
         };
+        let current_dir = settings_for_dir.borrow().download_dir.clone();
+        let _ = std::fs::create_dir_all(&current_dir);
+        let initial_folder = gio::File::for_path(&current_dir);
+
         let file_dialog = gtk::FileDialog::builder()
             .title("Select Download Folder")
+            .initial_folder(&initial_folder)
             .modal(true)
             .build();
 
@@ -128,6 +171,7 @@ pub fn show_preferences_dialog<F, U>(
             if let Ok(folder) = res {
                 if let Some(path) = folder.path() {
                     let norm = metadata::normalize_path(&path);
+                    let _ = std::fs::create_dir_all(&norm);
                     row_inner.set_subtitle(&norm.to_string_lossy());
                     {
                         let mut cfg = settings_inner.borrow_mut();
@@ -140,6 +184,7 @@ pub fn show_preferences_dialog<F, U>(
         });
     });
 
+    dir_row.add_suffix(&open_dir_btn);
     dir_row.add_suffix(&choose_dir_btn);
     dir_group.add(&dir_row);
     page.add(&dir_group);
@@ -341,13 +386,14 @@ pub fn show_preferences_dialog<F, U>(
     media_group.add(&sb_switch);
     page.add(&media_group);
 
-    // 4. Managed Tools (yt-dlp, ffmpeg, and deno in ~/.video_downloader/bin)
+    // 4. Managed Tools (yt-dlp, ffmpeg, and deno in managed_bin_dir)
     // Split into clean rows so narrow screens (< 398px) never overflow AdwBreakpointBin!
     let versions = InstalledToolVersions::load();
     let bin_dir_str = metadata::managed_bin_dir().to_string_lossy().to_string();
+    let bin_display = metadata::managed_bin_dir_display();
 
     let tools_group = adw::PreferencesGroup::builder()
-        .title("Managed Binaries (libsoup3)")
+        .title("Managed Binaries")
         .description(&bin_dir_str)
         .build();
 
@@ -388,7 +434,7 @@ pub fn show_preferences_dialog<F, U>(
 
     let open_bin_btn = gtk::Button::builder()
         .icon_name("folder-open-symbolic")
-        .tooltip_text("Open ~/.video_downloader/bin")
+        .tooltip_text(&format!("Open {}", bin_display))
         .valign(gtk::Align::Center)
         .build();
     open_bin_btn.connect_clicked(|_| {
@@ -398,9 +444,9 @@ pub fn show_preferences_dialog<F, U>(
     tools_group.add(&tools_row);
 
     // Managed Deno switch row (enabled by default; if disabled, system binaries are prioritized;
-    // if enabled later, deno is immediately downloaded into ~/.video_downloader/bin if missing)
+    // if enabled later, deno is immediately downloaded into managed_bin_dir if missing)
     let managed_deno_switch = adw::SwitchRow::builder()
-        .title("Use Managed Deno in ~/.video_downloader/bin")
+        .title(&format!("Use Managed Deno in {}", bin_display))
         .subtitle("Enabled by default; disable to prioritize system JS runtimes")
         .use_markup(false)
         .active(settings_rc.borrow().use_managed_deno)
@@ -422,8 +468,8 @@ pub fn show_preferences_dialog<F, U>(
     tools_group.add(&managed_deno_switch);
 
     let update_action_row = adw::ActionRow::builder()
-        .title("Update or Reinstall Tools")
-        .subtitle("Fetch latest yt-dlp, ffmpeg, and deno from GitHub Releases")
+        .title("Check for Tool Updates")
+        .subtitle("Update yt-dlp, ffmpeg, and deno if newer versions exist (or download if missing)")
         .use_markup(false)
         .title_lines(1)
         .subtitle_lines(2)
@@ -439,7 +485,7 @@ pub fn show_preferences_dialog<F, U>(
     let dialog_for_update = dialog.clone();
     let updater_for_force = on_trigger_updater_rc.clone();
     force_update_btn.connect_clicked(move |_| {
-        updater_for_force(true);
+        updater_for_force(false);
         dialog_for_update.close();
     });
 

@@ -73,20 +73,32 @@ impl BypassAttempt {
     }
 }
 
-/// Resolves the `yt-dlp` binary path, prioritizing `~/.video_downloader/bin/yt-dlp(.exe)`.
+/// Resolves the `yt-dlp` binary path, prioritizing `managed_bin_dir()/yt-dlp(.exe)`.
 pub fn resolve_ytdlp_executable() -> PathBuf {
     let managed = metadata::managed_ytdlp_path();
     if managed.exists() {
         return managed;
     }
+    for dir in metadata::candidate_bundled_bin_dirs() {
+        let candidate = dir.join(metadata::ytdlp_bin_name());
+        if candidate.exists() && candidate.is_file() {
+            return candidate;
+        }
+    }
     PathBuf::from(metadata::ytdlp_bin_name())
 }
 
-/// Resolves the directory containing `ffmpeg` if managed in `~/.video_downloader/bin`.
+/// Resolves the directory containing `ffmpeg` if managed in `managed_bin_dir()`.
 pub fn resolve_ffmpeg_dir() -> Option<PathBuf> {
     let managed_ffmpeg = metadata::managed_ffmpeg_path();
     if managed_ffmpeg.exists() {
         return Some(metadata::managed_bin_dir());
+    }
+    for dir in metadata::candidate_bundled_bin_dirs() {
+        let candidate = dir.join(metadata::ffmpeg_bin_name());
+        if candidate.exists() && candidate.is_file() {
+            return Some(dir);
+        }
     }
     None
 }
@@ -152,7 +164,7 @@ pub fn apply_bypass_and_network_args(
     args.push("4".to_string());
 
     // Enable JavaScript runtimes (deno, node, quickjs, bun) required by yt-dlp 2026+ EJS signature solving:
-    // - If `settings.use_managed_deno` is true (default), prioritize `~/.video_downloader/bin/deno` first.
+    // - If `settings.use_managed_deno` is true (default), prioritize `managed_bin_dir()/deno` first.
     // - If `settings.use_managed_deno` is false, prioritize system PATH binaries (`deno`, `node`, `quickjs`, `bun`).
     let managed_deno = metadata::managed_deno_path();
     if settings.use_managed_deno && managed_deno.exists() {
@@ -794,11 +806,11 @@ fn run_single_download_attempt(
 
     // Print markers so we can capture playlist item metadata, exact title, and final file path reliably
     args.push("--print".to_string());
-    args.push("video:__OMNI_ITEM__:%(playlist_index)s|||%(n_entries)s|||%(playlist_count)s|||%(playlist_title)s|||%(title)s".to_string());
+    args.push("video:__ARV_ITEM__:%(playlist_index)s|||%(n_entries)s|||%(playlist_count)s|||%(playlist_title)s|||%(title)s".to_string());
     args.push("--print".to_string());
-    args.push("before_dl:__OMNI_TITLE__:%(title)s".to_string());
+    args.push("before_dl:__ARV_TITLE__:%(title)s".to_string());
     args.push("--print".to_string());
-    args.push("after_move:__OMNI_FILEPATH__:%(filepath)s".to_string());
+    args.push("after_move:__ARV_FILEPATH__:%(filepath)s".to_string());
     args.push(task.url.clone());
 
     let mut cmd = Command::new(&ytdlp);
@@ -912,8 +924,8 @@ fn run_single_download_attempt(
             continue;
         }
 
-        // 3. Detect structured per-video metadata marker: `__OMNI_ITEM__:idx\tn_entries\tplaylist_count\tpl_title\tvid_title`
-        if let Some(item_meta) = parse_omni_item_marker(trimmed) {
+        // 3. Detect structured per-video metadata marker: `__ARV_ITEM__:idx\tn_entries\tplaylist_count\tpl_title\tvid_title`
+        if let Some(item_meta) = parse_arv_item_marker(trimmed) {
             if total_items == 0 {
                 if let Some(n) = item_meta.total_items {
                     total_items = n;
@@ -951,7 +963,7 @@ fn run_single_download_attempt(
         }
 
         // 4. Detect title right before download starts
-        if let Some(title) = trimmed.strip_prefix("__OMNI_TITLE__:") {
+        if let Some(title) = trimmed.strip_prefix("__ARV_TITLE__:") {
             let clean_title = title.trim().to_string();
             if !clean_title.is_empty() && clean_title != "NA" {
                 current_video_title = clean_title.clone();
@@ -975,7 +987,7 @@ fn run_single_download_attempt(
         }
 
         // 5. Detect completed file path for each finished item
-        if let Some(fp) = trimmed.strip_prefix("__OMNI_FILEPATH__:") {
+        if let Some(fp) = trimmed.strip_prefix("__ARV_FILEPATH__:") {
             let path = PathBuf::from(fp.trim());
             let norm_path = metadata::normalize_path(&path);
             detected_filepath = Some(norm_path.clone());
@@ -1113,7 +1125,7 @@ fn run_single_download_attempt(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ParsedOmniItem {
+pub struct ParsedArvItem {
     pub item_index: Option<u32>,
     pub total_items: Option<u32>,
     pub playlist_title: Option<String>,
@@ -1135,10 +1147,10 @@ pub fn parse_ytdlp_playlist_item_line(line: &str) -> Option<(u32, u32)> {
     Some((idx, total))
 }
 
-/// Parses `__OMNI_ITEM__:<playlist_index>|||<n_entries>|||<playlist_count>|||<playlist_title>|||<title>`
+/// Parses `__ARV_ITEM__:<playlist_index>|||<n_entries>|||<playlist_count>|||<playlist_title>|||<title>`
 /// (also supports `\t` separator for backwards compatibility).
-pub fn parse_omni_item_marker(line: &str) -> Option<ParsedOmniItem> {
-    let rest = line.strip_prefix("__OMNI_ITEM__:")?;
+pub fn parse_arv_item_marker(line: &str) -> Option<ParsedArvItem> {
+    let rest = line.strip_prefix("__ARV_ITEM__:")?;
     let parts: Vec<&str> = if rest.contains("|||") {
         rest.splitn(5, "|||").collect()
     } else {
@@ -1164,7 +1176,7 @@ pub fn parse_omni_item_marker(line: &str) -> Option<ParsedOmniItem> {
         String::new()
     };
 
-    Some(ParsedOmniItem {
+    Some(ParsedArvItem {
         item_index,
         total_items,
         playlist_title,
@@ -1313,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_playlist_item_and_omni_marker() {
+    fn test_parse_playlist_item_and_arv_marker() {
         assert_eq!(
             parse_ytdlp_playlist_item_line("[download] Downloading item 3 of 19"),
             Some((3, 19))
@@ -1323,8 +1335,8 @@ mod tests {
             Some((1, 5))
         );
 
-        let marker = "__OMNI_ITEM__:1|||2|||19|||Google - Year In Search (unofficial)|||2016 — Year in Search";
-        let parsed = parse_omni_item_marker(marker).expect("Should parse __OMNI_ITEM__");
+        let marker = "__ARV_ITEM__:1|||2|||19|||Google - Year In Search (unofficial)|||2016 — Year in Search";
+        let parsed = parse_arv_item_marker(marker).expect("Should parse __ARV_ITEM__");
         assert_eq!(parsed.item_index, Some(1));
         assert_eq!(parsed.total_items, Some(2));
         assert_eq!(
@@ -1337,7 +1349,7 @@ mod tests {
     #[test]
     fn test_playlist_dedicated_folder_and_length_args() {
         let settings = AppSettings::default();
-        let base_dir = std::env::temp_dir().join("omni_test_dl");
+        let base_dir = std::env::temp_dir().join("arv_test_dl");
         let mut args = Vec::new();
         apply_format_args(
             &mut args,
