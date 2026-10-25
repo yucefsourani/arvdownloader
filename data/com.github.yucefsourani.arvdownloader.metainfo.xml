@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.github.yucefsourani.arvdownloader</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>arvdownloader</name>
+  <summary>Modern cross-platform Video, Reels, Shorts, Playlist and MP3 Downloader</summary>
+  <description>
+    <p>
+      arvdownloader is a fast, modern GTK4 and Libadwaita desktop application for downloading
+      videos, Reels, Shorts, Playlists, and high-quality MP3/M4A audio across Linux and Windows.
+    </p>
+    <p>
+      Features include interactive playlist selection, dedicated playlist folders, automatic
+      browser cookie integration, managed Deno JS runtime support, and self-updating yt-dlp
+      and FFmpeg engines powered by libsoup3.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.github.yucefsourani.arvdownloader.desktop</launchable>
+  <url type="homepage">https://github.com/yucefsourani/arvdownloader</url>
+  <url type="bugtracker">https://github.com/yucefsourani/arvdownloader/issues</url>
+  <developer id="com.github.yucefsourani">
+    <name>Yucef Sourani</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-25" />
+  </releases>
+</component>

@@ -1,0 +1,157 @@
+name: Windows MSYS2 & Meson Build (GTK4 + Libadwaita + libsoup3)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: "arvdownloader"
+  BIN_NAME: "arvdownloader"
+  APP_ID: "com.github.yucefsourani.arvdownloader"
+  APP_VERSION: "0.1.0"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 & Install Dependencies (Meson, Rust, GTK4, Libadwaita, libsoup3)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-libsoup3
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-imagemagick
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-unzip
+
+      - name: Auto-Generate Multi-Resolution Icons (ICO & Hicolor PNGs)
+        run: |
+          SRC_ICON=""
+          if [ -f "data/icons/${APP_ID}.png" ]; then
+            SRC_ICON="data/icons/${APP_ID}.png"
+          elif [ -f "data/icons/${APP_ID}.svg" ]; then
+            SRC_ICON="data/icons/${APP_ID}.svg"
+          fi
+          if [ -n "$SRC_ICON" ]; then
+            magick -background none "$SRC_ICON" -define icon:auto-resize="256,128,64,48,32,16" icon.ico
+            cp icon.ico data/icons/icon.ico
+            for s in 16 24 32 48 64 128 256 512; do
+              mkdir -p "data/icons/hicolor/${s}x${s}/apps"
+              magick -background none "$SRC_ICON" -resize "${s}x${s}" "data/icons/hicolor/${s}x${s}/apps/${APP_ID}.png"
+            done
+          fi
+
+      - name: Configure & Build Release with Meson
+        run: |
+          meson setup build --buildtype=release
+          meson compile -C build
+
+      - name: Bundle Executable, Managed Binaries (yt-dlp/ffmpeg/deno), and GTK4 Runtime
+        run: |
+          mkdir -p dist/bundled_bin
+          cp "build/src/${BIN_NAME}.exe" dist/
+          cp icon.ico dist/ || true
+
+          # Bundle application icons for runtime lookup
+          mkdir -p dist/data/icons
+          cp -r data/icons/* dist/data/icons/ || true
+
+          # Pre-bundle yt-dlp.exe, ffmpeg.exe, ffprobe.exe, and deno.exe for first-run provisioning into %USERPROFILE%\.video_downloader\bin
+          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -o dist/bundled_bin/yt-dlp.exe
+          curl -L https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip -o ffmpeg.zip
+          unzip -j ffmpeg.zip "*/bin/ffmpeg.exe" "*/bin/ffprobe.exe" -d dist/bundled_bin/ || true
+          rm -f ffmpeg.zip
+          curl -L https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -o deno.zip
+          unzip -o -j deno.zip "deno.exe" -d dist/bundled_bin/ || true
+          rm -f deno.zip
+
+          # Bundle GDK-Pixbuf loaders (SVG/PNG/JPEG) and generate loaders.cache
+          mkdir -p dist/lib/gdk-pixbuf-2.0/2.10.0/loaders
+          cp /ucrt64/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll dist/lib/gdk-pixbuf-2.0/2.10.0/loaders/ || true
+          gdk-pixbuf-query-loaders > dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache || true
+
+          # Collect all required MSYS2 UCRT64 DLLs (GTK4, Libadwaita, libsoup3, GLib, Pango, Cairo, etc.)
+          ldd "dist/${BIN_NAME}.exe" dist/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll \
+            | grep '\/ucrt64.*\.dll' -o | sort -u | xargs -I{} cp -n {} dist/ || true
+
+          cp -n /ucrt64/bin/vulkan-1.dll dist/ || true
+          cp -n /ucrt64/bin/gdbus.exe dist/ || true
+
+          # Bundle GLib compiled schemas & icon themes
+          mkdir -p dist/share/glib-2.0/schemas
+          cp /ucrt64/share/glib-2.0/schemas/gschemas.compiled dist/share/glib-2.0/schemas/
+          mkdir -p dist/share/icons
+          cp -r /ucrt64/share/icons/hicolor dist/share/icons/ || true
+          cp -r /ucrt64/share/icons/Adwaita dist/share/icons/ || true
+          cp -r data/icons/hicolor/* dist/share/icons/hicolor/ || true
+          echo "GPL-3.0-or-later License" > dist/LICENSE
+
+      - name: Generate Inno Setup Script (.iss)
+        run: |
+          cat << EOF > installer.iss
+          [Setup]
+          AppName=${APP_NAME}
+          AppVersion=${APP_VERSION}
+          DefaultDirName={autopf}\\${APP_NAME}
+          OutputDir=out
+          OutputBaseFilename=${APP_NAME}-Windows-Setup
+          Compression=lzma2/ultra64
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+          DisableDirPage=no
+          DisableProgramGroupPage=yes
+          LicenseFile=dist\\LICENSE
+          SetupIconFile=dist\\icon.ico
+
+          [Files]
+          Source: "dist\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\\${APP_NAME}"; Filename: "{app}\\${BIN_NAME}.exe"; IconFilename: "{app}\\icon.ico"
+          Name: "{autodesktop}\\${APP_NAME}"; Filename: "{app}\\${BIN_NAME}.exe"; Tasks: desktopicon; IconFilename: "{app}\\icon.ico"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop icon"; GroupDescription: "Additional icons:"
+          EOF
+
+      - name: Compile Installer with Inno Setup
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\iscc.exe" installer.iss
+
+      - name: Upload Windows Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-Windows-Setup
+          path: out/${{ env.APP_NAME }}-Windows-Setup.exe
+
+      - name: Publish GitHub Release (on Tag Push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/${{ env.APP_NAME }}-Windows-Setup.exe
+          generate_release_notes: true

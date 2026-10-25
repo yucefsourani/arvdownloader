@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=arvdownloader
+GenericName=Video & Playlist Downloader
+Comment=Modern cross-platform Video, Reels, Shorts, Playlist and MP3 Downloader
+Exec=arvdownloader
+Icon=com.github.yucefsourani.arvdownloader
+Terminal=false
+Type=Application
+Categories=Network;AudioVideo;Video;GTK;
+Keywords=video;download;youtube;reels;shorts;playlist;mp3;yt-dlp;arvdownloader;
+StartupNotify=true
+StartupWMClass=com.github.yucefsourani.arvdownloader
