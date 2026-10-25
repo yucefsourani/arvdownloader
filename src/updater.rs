@@ -672,7 +672,10 @@ fn extract_and_install_ffmpeg(archive_path: &Path, bin_dir: &Path) -> Result<(),
             if entry.is_dir() {
                 continue;
             }
-            let entry_name = entry.name().replace('\\', "/");
+            let Ok(raw_name) = entry.name() else {
+                continue;
+            };
+            let entry_name = raw_name.replace('\\', "/");
             let file_basename = entry_name.rsplit('/').next().unwrap_or("");
             if file_basename.eq_ignore_ascii_case(ffmpeg_name)
                 || file_basename.eq_ignore_ascii_case(ffprobe_name)
@@ -836,7 +839,10 @@ fn extract_and_install_deno(archive_path: &Path, bin_dir: &Path) -> Result<(), S
         if entry.is_dir() {
             continue;
         }
-        let entry_name = entry.name().replace('\\', "/");
+        let Ok(raw_name) = entry.name() else {
+            continue;
+        };
+        let entry_name = raw_name.replace('\\', "/");
         let file_basename = entry_name.rsplit('/').next().unwrap_or("");
         if file_basename.eq_ignore_ascii_case(deno_name) {
             let temp_out = metadata::staging_dir().join(file_basename);
