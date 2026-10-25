@@ -80,15 +80,6 @@ jobs:
           mkdir -p dist/data/icons
           cp -r data/icons/* dist/data/icons/ || true
 
-          # Pre-bundle yt-dlp.exe, ffmpeg.exe, ffprobe.exe, and deno.exe for first-run provisioning into %USERPROFILE%\.video_downloader\bin
-          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -o dist/bundled_bin/yt-dlp.exe
-          curl -L https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip -o ffmpeg.zip
-          unzip -j ffmpeg.zip "*/bin/ffmpeg.exe" "*/bin/ffprobe.exe" -d dist/bundled_bin/ || true
-          rm -f ffmpeg.zip
-          curl -L https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -o deno.zip
-          unzip -o -j deno.zip "deno.exe" -d dist/bundled_bin/ || true
-          rm -f deno.zip
-
           # Bundle GDK-Pixbuf loaders (SVG/PNG/JPEG) and generate loaders.cache
           mkdir -p dist/lib/gdk-pixbuf-2.0/2.10.0/loaders
           cp /ucrt64/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.dll dist/lib/gdk-pixbuf-2.0/2.10.0/loaders/ || true
